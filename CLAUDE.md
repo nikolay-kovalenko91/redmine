@@ -26,7 +26,7 @@ The required core is working Personal Access Tokens (PATs).
    explicitly approved by the human.
 4. Record approved scope, alternatives considered, decisions, rationale,
    trade-offs, deferred work, acceptance criteria and verification strategy
-   in `docs/plan.md`.
+   in `doc/issue-43881/plan.md`.
 5. During implementation, work incrementally and use tests as the primary
    deterministic feedback loop.
 6. If implementation requires changing an approved architecture, migration
