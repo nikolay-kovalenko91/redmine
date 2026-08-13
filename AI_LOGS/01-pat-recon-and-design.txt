@@ -1,0 +1,2971 @@
+ ▐▛███▜▌   Claude Code v2.1.231
+▝▜█████▛▘  Opus 5 · Claude Pro
+  ▘▘ ▝▝    ~/Development/redmine
+
+   Tackle your toughest work with Opus 5. Switch anytime with /model.
+
+❯ /effort high                                                                  
+  ⎿  Set effort level to high (saved as your default for new sessions):
+     Comprehensive implementation with extensive testing and documentation ·
+     burns fastest — medium handles most tasks
+
+❯ /rename 01-pat-recon-and-design 
+  ⎿  Session renamed to: 01-pat-recon-and-design
+
+❯ We are implementing the Strengthen API authentication challenge against       
+  Redmine 6.1.2.                                                                
+                                                                                
+  Do not modify application code.                                               
+                                                                                
+  The required core is working Personal Access Tokens.                          
+  Rate limiting is explicitly out of scope.                                     
+  Scopes, granular endpoint control, audit logging and CORS are optional,       
+  and should not be added unless there is a compelling reason after the         
+  required core is complete.                                                    
+                                                                                
+  Use the built-in Explore subagent with very thorough investigation.           
+                                                                                
+  Important constraints for Explore:                                            
+  - inspect the actual Redmine 6.1.2 repository rather than relying on generic  
+  Rails knowledge;                                                              
+  - do not modify anything;                                                     
+  - focus only on code relevant to this task.                                   
+                                                                                
+  Investigate:                                                                  
+                                                                                
+  1. the complete existing REST API authentication flow;                        
+  2. all ways the current legacy API key can enter a request;                   
+  3. User and Token models and token lookup/storage behaviour;                  
+  4. current API-key management in My Account;                                  
+  5. routes and controllers involved;                                           
+  6. OAuth/Doorkeeper interaction with API authentication;                      
+  7. account-status checks and other authentication invariants;                 
+  8. relevant migrations and database conventions;                              
+  9. existing authentication/model/controller tests;                            
+  10. relevant Redmine testing and linting commands.                            
+                                                                                
+  After reconnaissance:                                                         
+                                                                                
+  A. Report repository evidence with file/class/method references.              
+  B. Identify assumptions that still need verification.                         
+  C. Propose 2-3 minimal architecture options for implementing the PAT core.    
+  D. Compare their regression surface, migration impact, backward               
+     compatibility, security properties and implementation complexity.          
+  E. Recommend a focused slice that can realistically be finished and verified. 
+  F. Explicitly list what should be deferred.                                   
+                                                                                
+  Do not implement anything.                                                    
+  Wait for my architecture decision.                                            
+
+⏺ I'll start by launching Explore agents to investigate the Redmine 6.1.2
+  authentication surface thoroughly.
+
+⏺ 2 Explore agents finished (ctrl+o to expand)
+   ├ Explore REST API auth flow · 59 tool uses · 95.7k tokens
+   │ ⎿  Done
+   └ Explore Token/User models and My Account · 41 tool uses · 61.8k tokens
+     ⎿  Done
+
+⏺ Both reconnaissance passes returned. Let me verify the critical seams directly
+  before designing options.
+
+  Read 3 files (ctrl+o to expand)
+
+⏺ Reconnaissance complete. Here is the report.
+
+  ---
+  A. Repository evidence
+
+  A1. The authentication chain
+
+  app/controllers/application_controller.rb:64 declares the filter chain:
+  before_action :session_expiration, :user_setup, :check_if_login_required,
+  :set_localization, :check_password_change, :check_twofa_activation
+
+  user_setup (application_controller.rb:102-108) sets User.current = 
+  find_current_user.
+
+  find_current_user (application_controller.rb:112-173) is the single seam. Its
+  structure:
+
+  - :114-129 — session / autologin / atom-key, wrapped in unless api_request?
+  - :130 — if user.nil? && Setting.rest_api_enabled? && accept_api_auth? opens
+  the API block
+  - :131-133 — if (key = api_key_from_request) → User.find_by_api_key(key)
+  - :134-141 — elsif access_token = Doorkeeper.authenticate(request) → OAuth,
+  sets user.oauth_scope
+  - :142-158 — elsif /\ABasic /i → User.try_to_login, 2FA rejection, then user 
+  ||= User.find_by_api_key(username), then must_change_password? → 403
+  - :160-168 — X-Redmine-Switch-User
+
+  Structural fact: the API block at :130 is not gated on api_request?. It is
+  gated only on Setting.rest_api_enabled? and accept_api_auth?. API credentials
+  therefore work on HTML requests for opted-in actions — deliberately, per
+  test/integration/api_test/authentication_test.rb:131-163.
+
+  A2. Every way a legacy API key enters a request
+
+  application_controller.rb:727-734:
+  def api_key_from_request
+    if params[:key].present?
+      params[:key].to_s
+    elsif request.headers["X-Redmine-API-Key"].present?
+      request.headers["X-Redmine-API-Key"].to_s
+    end
+  end
+
+  ┌──────────────────────────────────────┬──────────┬───────────────────────┐
+  │                Vector                │   Code   │      Precedence       │
+  ├──────────────────────────────────────┼──────────┼───────────────────────┤
+  │ key query/form param                 │ :729-730 │ 1                     │
+  ├──────────────────────────────────────┼──────────┼───────────────────────┤
+  │ X-Redmine-API-Key header             │ :731-732 │ 2                     │
+  ├──────────────────────────────────────┼──────────┼───────────────────────┤
+  │ OAuth Bearer / access_token /        │ :134     │ 3 (only if 1+2        │
+  │ bearer_token                         │          │ absent)               │
+  ├──────────────────────────────────────┼──────────┼───────────────────────┤
+  │ Basic: username/password             │ :145     │ 4                     │
+  ├──────────────────────────────────────┼──────────┼───────────────────────┤
+  │ Basic: username = API key, password  │ :152     │ 4 (fallback in same   │
+  │ anything                             │          │ branch)               │
+  └──────────────────────────────────────┴──────────┴───────────────────────┘
+
+  Precedence is a plain if/elsif chain, so a present-but-invalid key param 
+  short-circuits everything else → 401. Separate, unrelated key mechanisms exist
+  in SysController (sys_controller.rb:84) and MailHandlerController
+  (mail_handler_controller.rb:72); both inherit ActionController::Base and are
+  out of scope.
+
+  A3. Token model and storage
+
+  app/models/token.rb:
+  - :39 add_action :api, max_instances: 1, validity_time: nil → one per user, 
+  never expires
+  - :113-126 find_token — plaintext equality Token.find_by(:action =>, :value 
+  =>), guarded by /\A[a-z0-9]+\z/i (line :116) — rejects any key containing _, 
+  -, or .; secure_compare at :121 is defence-in-depth after the DB already
+  matched
+  - :96-101 find_active_user → user.active? check
+  - :128-130 generate_token_value → Redmine::Utils.random_hex(20) = 40 hex chars
+  - :135-147 delete_previous_tokens — the max_instances invariant is enforced by
+  delete-on-create, not by a DB constraint
+
+  db/schema.rb:549-557 — storage is plaintext:
+  create_table "tokens", force: :cascade do |t|
+    t.integer "user_id", default: 0, null: false
+    t.string "action", limit: 30, default: "", null: false
+    t.string "value", limit: 40, default: "", null: false
+    t.datetime "created_on", precision: nil, null: false
+    t.datetime "updated_on"
+    t.index ["user_id"], name: "index_tokens_on_user_id"
+    t.index ["value"], name: "tokens_value", unique: true
+  end
+  No expires_on. value is limit: 40. No FK constraints anywhere in Redmine.
+
+  app/models/user.rb:101-102 — no has_many :tokens, only two scoped has_ones:
+  has_one :atom_token, lambda {where "#{table.name}.action='feeds'"},
+  :class_name => 'Token'
+  has_one :api_token,  lambda {where "#{table.name}.action='api'"},
+  :class_name => 'Token'
+
+  user.rb:442-448 api_key is a side-effecting reader — it creates a token if
+  none exists. user.rb:553-555 find_by_api_key → Token.find_active_user('api', 
+  key).
+
+  A4. Security gaps in the current design (evidence, not speculation)
+
+  user.rb:958-967:
+  def destroy_tokens
+    if saved_change_to_hashed_password? || (saved_change_to_status? && !active?)
+  || (saved_change_to_twofa_scheme? && twofa_scheme.present?)
+      tokens = ['recovery', 'autologin', 'session']
+      Token.where(:user_id => id, :action => tokens).delete_all
+    end
+  end
+  'api' is not in that list — an API key survives password change, lock, and 2FA
+  enrolment. (Lock is still caught at lookup time by find_active_user.)
+
+  Invariants applied to session logins but not to API-key logins:
+  - must_change_password? → checked only inside the Basic branch (:154); never
+  for the key param / header path
+  - twofa_active? → blocks Basic username/password (:147) only
+  - sudo mode → fully bypassed for API-format requests
+  (lib/redmine/sudo_mode.rb:156-165)
+  - update_last_login_on! → not called
+  - No expiry, no scoping, no per-token identity, no revocation UI beyond a
+  single global reset
+
+  A5. My Account API-key management
+
+  app/controllers/my_controller.rb:26-29:
+  accept_api_auth :account
+  require_sudo_mode :account, only: :put
+  require_sudo_mode :reset_atom_key, :reset_api_key, :show_api_key, :destroy
+  Actions: show_api_key (:134-136), reset_api_key (:139-150). There is no 
+  api_key action and no api_key.html.erb — the UI lives in
+  app/views/my/_sidebar.html.erb:21-48, gated on Setting.rest_api_enabled?, with
+  show_api_key.js.erb for the reveal and
+  app/javascript/controllers/api_key_copy_controller.js (Stimulus) for copy.
+
+  Routes config/routes.rb:97-98:
+  get  'my/api_key', :to => 'my#show_api_key', :as => 'my_api_key'
+  post 'my/api_key', :to => 'my#reset_api_key'
+
+  app/views/my/account.api.rsb:10 — GET /my/account.json returns api_key.
+
+  A6. OAuth / Doorkeeper — already present
+
+  Gemfile:22 gem "doorkeeper", "~> 5.8.2". Configured in
+  config/initializers/30-redmine.rb:24-88, not in doorkeeper.rb (intentionally
+  empty). Notably:
+  - :41 hash_token_secrets — OAuth tokens are already hashed at rest, unlike API
+  keys
+  - :47 grant_flows ['authorization_code'] only
+  - :52 optional_scopes(*(Redmine::AccessControl.permissions.map(&:name) << 
+  :admin)) — scopes are Redmine permission names
+  - :56 enforce_configured_scopes
+
+  Scope enforcement lives in the model: user.rb:736-744 admin? and
+  user.rb:770,789 pass @oauth_scope into Role#allowed_to?(action, scope)
+  (role.rb:204-210, :304-311). This (action, scope) arity is an existing seam if
+  scoping is ever wanted.
+
+  app/views/users/show.api.rsb:14 deliberately hides api_key from
+  OAuth-authenticated self-reads — i.e. OAuth must not escalate to the unscoped
+  API key.
+
+  A7. Migration and DB conventions
+
+  - db/schema.rb (not structure.sql), header
+  ActiveRecord::Schema[7.2].define(version: 2025_06_11_092227)
+  - Current convention for a new migration: ActiveRecord::Migration[7.2]
+  - Best in-repo template:
+  db/migrate/20250611092155_create_doorkeeper_tables.rb:38-65
+  - config/database.yml is sqlite3 for dev and test; CI
+  (.github/workflows/tests.yml:11-15) matrixes postgresql/mysql2/sqlite3 →
+  migrations must be portable
+
+  A8. Existing tests
+
+  - test/integration/api_test/authentication_test.rb — 18 tests, the canonical
+  regression suite. Pattern (:58-63):
+  user = User.generate!
+  token = Token.create!(:user => user, :action => 'api')
+  get '/users/current.xml', :headers => credentials(token.value, 'X')
+  assert_response :ok
+  - test/integration/api_test/disabled_rest_api_test.rb — 3 tests
+  - test/unit/token_test.rb — 14 tests; test_destroy_expired_* assert the return
+  value of Token.destroy_expired
+  - test/unit/user_test.rb:857-905 — api_key / find_by_api_key tests; :470-505 —
+  token destruction on password/mail change
+  - test/functional/my_controller_test.rb:791-836 — atom/api key actions
+  - test/fixtures/tokens.yml — only 2 records, no api token (which is why
+  test_reset_api_key_without_existing_key works)
+  - test/test_helper.rb:428-430 credentials(user, password=nil); :433-440
+  Redmine::ApiTest::Base sets Setting.rest_api_enabled = '1' in setup
+  - There is no should_allow_api_authentication macro in 6.1.2 — it was removed;
+  no shared test macros remain
+
+  A9. Commands
+
+  ┌──────────────────┬───────────────────────────────────────────────────────┐
+  │     Purpose      │                        Command                        │
+  ├──────────────────┼───────────────────────────────────────────────────────┤
+  │ Full suite       │ bundle exec rake test                                 │
+  ├──────────────────┼───────────────────────────────────────────────────────┤
+  │ Single file      │ bin/rails test test/unit/token_test.rb                │
+  ├──────────────────┼───────────────────────────────────────────────────────┤
+  │ Single method    │ bin/rails test test/unit/token_test.rb -n test_create │
+  ├──────────────────┼───────────────────────────────────────────────────────┤
+  │ Rubocop          │ bundle exec rubocop (CI: --parallel)                  │
+  ├──────────────────┼───────────────────────────────────────────────────────┤
+  │ Migrate          │ bundle exec rails db:migrate                          │
+  ├──────────────────┼───────────────────────────────────────────────────────┤
+  │ Locales backfill │ rake locales:update (en.yml by hand only)             │
+  └──────────────────┴───────────────────────────────────────────────────────┘
+
+  .rubocop.yml — TargetRubyVersion: 3.2, TargetRailsVersion: 7.2; excludes
+  db/schema.rb and lib/tasks/**.
+
+  ---
+  B. Assumptions still needing verification
+
+  1. Baseline green. I have not run rake test or rubocop. Whether the suite is
+  currently 100% green on this machine (SCM tests in particular need rake 
+  test:scm:setup:all) is unverified.
+  2. belongs_to optionality. token_test.rb:27-32 creates a Token with no user,
+  implying belongs_to_required_by_default is off — I did not read
+  config/application.rb to confirm.
+  3. Sudo mode is off in test env — inferred from my_controller_test.rb not
+  stubbing it; not directly confirmed in config/environments/test.rb.
+  4. DB portability of a partial/functional index — not attempted; a plain
+  unique index on a hash column is safe, anything cleverer is not.
+  5. Whether db/redmine.sqlite3 currently reflects a clean 6.1.2 schema (needed
+  for the "migrate from stock 6.1.2" gate).
+
+  ---
+  C/D. Architecture options
+
+  Option 1 — New PersonalAccessToken model + personal_access_tokens table
+
+  Separate AR model, migration [7.2], columns: user_id, name, token_hash,
+  expires_on, last_used_on, revoked_at, created_on, updated_on. Unique index on
+  token_hash, index on user_id. Integration is ~6 lines inside find_current_user
+  plus a prefix dispatch in the key-reading path.
+
+  - Regression surface: lowest. Token, tokens, destroy_expired,
+  delete_previous_tokens all untouched → token_test.rb and user_test.rb token
+  tests cannot break.
+  - Migration impact: one additive create_table. Trivially reversible. Portable
+  across sqlite/pg/mysql.
+  - Backward compat: total. Legacy key path is byte-for-byte unchanged.
+  - Security: hash at rest (SHA-256 of a high-entropy secret — not bcrypt,
+  because lookup must be by index, and the secret is already 160+ bits so a slow
+  KDF buys nothing); native expiry; native revocation; per-token identity; can
+  enforce must_change_password? / status uniformly.
+  - Complexity: moderate — one model, one migration, one controller area, one
+  view area, tests.
+
+  Option 2 — Extend the existing Token model with a pat action
+
+  Add name, expires_on, last_used_on columns to tokens; widen value to hold a
+  hash; add_action :pat, max_instances: nil.
+
+  - Regression surface: highest. tokens is shared by session, autologin,
+  recovery, register, feeds, twofa_backup_code. Changing value's
+  width/semantics, find_token's /\A[a-z0-9]+\z/i guard, delete_previous_tokens's
+  max_instances logic, or destroy_expired's Arel touches all seven actions.
+  token_test.rb asserts Token.destroy_expired's return count.
+  - Migration impact: change_column on a hot shared table with a unique index;
+  the 2013 migration already warns this "may take some time".
+  - Backward compat: risk of subtle breakage in autologin/session/recovery.
+  - Security: to hash PAT values you'd have to either hash everything (breaking
+  autologin/recovery lookups) or make value polymorphic per action — an
+  unpleasant invariant.
+  - Complexity: deceptively low up front, high in verification.
+
+  Option 3 — Mint Doorkeeper access tokens as PATs
+
+  Reuse Doorkeeper::AccessToken with a synthetic "personal" application. Gets
+  hashing (hash_token_secrets), expires_in, revoked_at, and scopes for free;
+  find_current_user:134 already accepts them.
+
+  - Regression surface: low in Redmine code, but couples PATs to Doorkeeper's
+  config, which currently declares grant_flows ['authorization_code'] and
+  enforce_configured_scopes.
+  - Migration impact: none.
+  - Backward compat: PATs would arrive as Authorization: Bearer, not via
+  X-Redmine-API-Key — every existing Redmine client would need changing.
+  api_key_from_request takes precedence over the Bearer branch, so a client
+  sending both breaks.
+  - Security: strongest primitives, but semantics are wrong: a PAT is not an
+  OAuth grant, and there's no application/consent to point at. oauth_scope would
+  be set, silently changing admin? and allowed_to? behaviour — a behavioural
+  change the CLAUDE.md scope rules forbid without approval.
+  - Complexity: low code, high conceptual and review risk.
+
+  ---
+  E. Recommendation
+
+  Option 1, sliced as follows:
+
+  1. PersonalAccessToken model + [7.2] migration (additive table only).
+  2. Token format rmpat_<40 hex> — the prefix makes dispatch deterministic at
+  the api_key_from_request seam, is greppable for secret scanning, and cannot
+  collide with a legacy 40-hex key. Note Token.find_token's /\A[a-z0-9]+\z/i
+  guard means a prefixed value is structurally incapable of being mistaken for a
+  legacy token.
+  3. Accept PATs through the existing vectors — key param, X-Redmine-API-Key
+  header, HTTP Basic username — so existing clients work by swapping the string
+  only.
+  4. Enforce, for PATs, the invariants the legacy key misses: user active?, not
+  expired, not revoked, and must_change_password? → 403 (parity with the Basic
+  branch).
+  5. My Account UI: list / create (with name + optional expiry) / revoke, secret
+  shown exactly once, under the existing require_sudo_mode convention.
+  6. Legacy API key continues to work unchanged.
+
+  F. Explicitly deferred
+
+  - Rate limiting (out of scope by instruction)
+  - Scopes / granular endpoint control (Role#allowed_to?(action, scope) seam
+  documented but unused)
+  - Audit logging
+  - CORS
+  - Changing destroy_tokens to revoke legacy 'api' tokens on password change — a
+  real hardening, but it changes existing Redmine behaviour and belongs to a
+  separate decision
+  - Migrating existing legacy keys to PATs
+  - Admin-side PAT management for other users
+  - X-Redmine-Switch-User interaction beyond inheriting current behaviour
+  - Rewriting api_request? / accept_api_auth semantics
+
+  Four decisions are yours before I write the plan.
+
+⏺ User declined to answer questions
+  ⎿  · Which architecture should the PAT core use? (New PersonalAccessToken 
+     model (Recommended) / Extend Token with a 'pat' action / Doorkeeper-backed 
+     PATs)
+     · How should PATs be transmitted, and what happens to the legacy API key? 
+     (Reuse existing vectors, legacy stays (Recommended) / Dedicated 
+     Authorization header for PATs / Reuse vectors + setting to disable legacy)
+     · How should PAT secrets be stored, and what expiry policy applies? 
+     (SHA-256 hash, optional expiry (Recommended) / SHA-256 hash, expiry 
+     mandatory / bcrypt hash, optional expiry)
+     · Which authentication invariants should PATs enforce beyond what the 
+     legacy key does today? (active? + not expired + not revoked / 
+     must_change_password? -> 403 / Revoke PATs on password change / lock / 
+     Track last_used_on)
+
+⏺ The reconnaissance report above stands on its own — what would you like to
+  clarify before I reframe the decisions?
+
+  A few things I can expand on if useful:
+
+  - Evidence for any specific claim — e.g. why I concluded the API block at
+  application_controller.rb:130 isn't gated on api_request?, or how
+  Token.find_token's /\A[a-z0-9]+\z/i guard at token.rb:116 constrains token
+  format.
+  - Whether the options are the right ones — if you have a fourth architecture
+  in mind, or think one of the three is a non-starter, say so and I'll drop or
+  replace it.
+  - Whether these are the right questions — I split them into architecture /
+  transport / storage / invariants because those are the axes where a wrong
+  guess would produce materially different work. If you'd rather decide
+  architecture first and defer the rest, or if some of these aren't actually
+  open in your mind, I'll restructure.
+  - Scope calibration — the "invariants" question is the one most likely to
+  creep. Two of its four options (PAT revocation on password change,
+  last_used_on) are arguably hardening beyond the required core, and I can move
+  them to the deferred list instead of putting them to a vote.
+  - Anything in section B — the unverified assumptions. I can go confirm any of
+  them read-only right now (baseline rake test state, sudo mode in the test env,
+  belongs_to optionality) before you decide.
+
+  What's on your mind?
+
+✻ Cogitated for 9m 56s
+
+❯ Two assumptions are already verified by me:                                   
+  1. Baseline test suite is green. I ran it manually on this machine and all    
+  tests passed.                                                                 
+  2. db/redmine.sqlite3 reflects the stock Redmine 6.1.2 schema. I              
+  created/prepared it by applying the Redmine 6.1.2 migrations.                 
+  Do not leave the rest as implicit assumptions. Before I approve the plan:     
+  1. Verify belongs_to optionality directly from the repository configuration.  
+  This should be a targeted lookup only.                                        
+  2. Do not spend time verifying sudo-mode configuration unless it becomes      
+  relevant to the chosen management/controller implementation.                  
+  3. Prefer a simple portable index. Do not introduce partial/functional or     
+  database-specific indexing unless the design actually requires it.            
+  After these targeted checks, update the assumptions section and proceed with  
+  the architecture questions:                                                   
+  1. What are the exact expiration semantics? The ticket requires mandatory     
+  expiration, while the current proposal mentions optional expiry. Should we    
+  use expires_at or expires_on, and what is the exact validity boundary and     
+  timezone behavior?                                                            
+  2. What exact authentication seam should PATs integrate with, and where       
+  should PAT-vs-legacy dispatch happen? Show the exact control flow for query   
+  parameter, X-Redmine-API-Key, and HTTP Basic authentication, including how    
+  legacy API-key behavior remains unchanged.                                    
+  3. How will PAT-management endpoints be protected? Can a PAT-authenticated    
+  request create or revoke PATs, or must management require an interactive      
+  session and existing sudo-mode protection?                                    
+  4. What is the exact create-and-reveal flow for the plaintext PAT? Explain    
+  how the raw token is shown exactly once without being persisted in the        
+  database, session, flash, URL, or logs.                                       
+  5. What is the minimal PAT schema for this slice? Justify every field. In     
+  particular, should last_used_on be omitted if tracking is deferred, and       
+  should revocation use revoked_at or physical deletion?                        
+  6. What account-state rules should PAT authentication follow? Define behavior 
+  for inactive/locked users, must_change_password?, password changes, and 2FA   
+  enrollment. Separate required PAT behavior from unrelated legacy hardening.   
+  7. What exactly is the minimum self-service PAT lifecycle we are committing   
+  to for this challenge, and which features from issue #43881 are explicitly    
+  deferred?                                                                     
+  For each answer, cite the relevant Redmine 6.1.2 code or ticket requirement   
+  where applicable. End with the three most important trade-offs/risks of the   
+  resulting design. Do not implement anything yet.                              
+
+⏺ I'll run the targeted checks first.
+
+  Searched for 5 patterns, read 1 file, listed 2 directories, ran 4 shell commands (ctrl+o to expand)
+
+⏺ Targeted checks done. Two follow-ups that became relevant to the answers
+  below:
+
+  Searched for 3 patterns, ran 1 shell command (ctrl+o to expand)
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ Targeted checks — results
+
+  1. belongs_to optionality — CONFIRMED OPTIONAL.
+  config/application.rb has no config.load_defaults call and no
+  belongs_to_required_by_default setting (verified by grepping all of config/).
+  activerecord-7.2.3/lib/active_record/core.rb:89 declares class_attribute 
+  :belongs_to_required_by_default with no default value → nil → falsy. Rails
+  only flips it to true via load_defaults 5.0+. Corroborated by
+  test/unit/token_test.rb:27-32 (Token.new.save with no user) passing on your
+  green baseline, and by token.rb:21 carrying no optional: true.
+  Consequence: belongs_to :user on the new model will be optional by default, so
+  I must add null: false at the DB level and an explicit presence validation —
+  not rely on Rails.
+
+  2. Sudo-mode — I only looked up the default, because it did become relevant to
+  the management design (Q3). config/configuration.yml.example:167: "Disabled
+  by default"; lib/redmine/sudo_mode.rb:233 Redmine::Configuration['sudo_mode'] 
+  && .... Recorded as a stated fact, not investigated further.
+
+  3. Indexes — agreed and adopted. Two plain single-column B-trees only.
+
+  Assumptions section — updated
+
+  ┌──────────────────────────┬──────────────────────────────────────────────┐
+  │       Was assumed        │                     Now                      │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │ Baseline suite green     │ Verified by you                              │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │ db/redmine.sqlite3 at    │ Verified by you                              │
+  │ stock 6.1.2              │                                              │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │ belongs_to optional      │ Verified from config + gem source (above)    │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │ Sudo mode off in test    │ Resolved differently — sudo mode is off by   │
+  │ env                      │ default everywhere; no test-env              │
+  │                          │ investigation needed                         │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │ Partial/functional index │ Moot — design uses plain indexes only        │
+  │  portability             │                                              │
+  └──────────────────────────┴──────────────────────────────────────────────┘
+
+  One assumption remains, and I want it on the record rather than buried: I have
+  no repository or ticket evidence for the "mandatory expiration" requirement.
+  There is no doc/issue-43881/ directory and no local copy of the ticket. Q1
+  below treats mandatory expiry as a requirement solely on your statement of it.
+  Everything else below is cited to code.
+
+  ---
+  1. Expiration semantics
+
+  Column name: expires_on. This is not a coin-flip — the evidence is decisive. I
+  mapped every datetime column in db/schema.rb to its table: every Redmine-core
+  table uses _on (created_on, updated_on, last_login_on, passwd_changed_on,
+  closed_on, committed_on), and every _at column belongs to a vendored or 
+  generated table — oauth_access_tokens/oauth_access_grants/oauth_applications
+  (doorkeeper), imports and reactions (Rails t.timestamps). tokens itself uses
+  created_on/updated_on. _at would mark the table as foreign to Redmine core.
+
+  Note _on in Redmine does not imply date-only: users.passwd_changed_on is
+  t.datetime ... precision: nil (db/schema.rb:592). So t.datetime :expires_on, 
+  precision: nil, null: false — precision: nil matching core convention
+  (doorkeeper's tables omit it and get precision 6).
+
+  Type: datetime, not date. A date-only expiry has an ambiguous boundary
+  (midnight in whose zone?). Store the absolute instant, computed at creation as
+  Time.now + n.days.
+
+  Timezone — this is the trap. config/application.rb:37:
+  config.active_record.default_timezone = :local
+  and config.time_zone is left commented out (:51-53), so Time.zone is UTC while
+  ActiveRecord serializes in server local time. Redmine core resolves this by
+  consistently using Time.now, never Time.zone.now:
+
+  - token.rb:70 — Time.now - validity_time
+  - token.rb:123 — token.created_on > validity_days.days.ago
+  - user.rb:363 — changed_on < period.days.ago (in password_expired?)
+
+  Rule for PAT code: use Time.now, .ago, .from_now. Never Time.zone.*. Mixing
+  the two produces a silent offset bug exactly equal to the server's UTC offset
+  — which on a UTC server is zero, so it would pass CI and fail in production.
+  This is worth a code comment.
+
+  Boundary — exclusive at the instant of expiry:
+  def expired?
+    expires_on <= Time.now
+  end
+  Valid while Time.now < expires_on; dead at and after expires_on. precision: 
+  nil means whole-second granularity, so the boundary is one second wide. The
+  closest core analogue is password_expired? (user.rb:357-365), which uses the
+  same plain Time comparison against a precision: nil column.
+
+  Mandatory: null: false at the DB level, validates :expires_on, :presence => 
+  true, plus a validation that it is in the future and within MAX_LIFETIME = 
+  365.days. UI offers presets (30/60/90/365 days). Max lifetime is a model 
+  constant, not a Setting — a Setting would drag in settings.yml, an admin view
+  and an en.yml key for no required benefit. Deferred.
+
+  2. Auth seam and dispatch — exact control flow
+
+  The seam is find_current_user (application_controller.rb:112-173), and 
+  specifically two lines: :131-133 and :152. Nothing else changes.
+
+  api_key_from_request (:727-734) is not the right dispatch point — it returns a
+  string and has no lookup responsibility. Dispatching there would also miss
+  the Basic vector, which reads username directly.
+
+  Vector 1 — ?key= query/form parameter, and Vector 2 — X-Redmine-API-Key
+
+  Both flow through the same line, because api_key_from_request already
+  collapses them (param wins over header, :729-732). Current code:
+
+  if (key = api_key_from_request)
+    user = User.find_by_api_key(key)
+
+  Becomes:
+
+  if (key = api_key_from_request)
+    if PersonalAccessToken.pat_format?(key)
+      user = PersonalAccessToken.find_active_user(key)
+      if user && user.must_change_password?
+        render_error :message => 'You must change your password', :status => 403
+        return
+      end
+    else
+      user = User.find_by_api_key(key)          # UNCHANGED legacy path
+    end
+
+  Vector 3 — HTTP Basic, credential as username
+
+  Current (:142-157):
+  elsif /\ABasic /i.match?(request.authorization.to_s)
+    authenticate_with_http_basic do |username, password|
+      user = User.try_to_login(username, password)
+      if user&.twofa_active?  ... 401 ... end
+      user ||= User.find_by_api_key(username)
+    end
+    if user && user.must_change_password?  ... 403 ... end
+
+  Only line :152 changes:
+      user ||= if PersonalAccessToken.pat_format?(username)
+                 PersonalAccessToken.find_active_user(username)
+               else
+                 User.find_by_api_key(username)    # UNCHANGED
+               end
+
+  The must_change_password? 403 at :154-157 already sits outside the 
+  authenticate_with_http_basic block and applies to whatever user resolved to — 
+  so it covers PATs on this vector with zero changes. That is why the new 403
+  check is needed only in the param/header branch.
+
+  How legacy behaviour stays identical
+
+  1. Precedence is untouched. The if/elsif/elsif chain at :131/:134/:142 is not
+  reordered. A PAT in params[:key] short-circuits Doorkeeper and Basic exactly
+  as a legacy key does today.
+  2. User.find_by_api_key is called with byte-identical arguments on every
+  legacy path. Token, tokens, find_token, delete_previous_tokens,
+  destroy_expired — all untouched.
+  3. The two namespaces are provably disjoint, structurally. token.rb:116:
+  return nil unless action.present? && /\A[a-z0-9]+\z/i.match?(key)
+  3. An rmpat_-prefixed string contains _ and therefore cannot resolve as a
+  legacy token — even if pat_format? had a bug and fell through to the legacy
+  branch, the result is nil, not a wrong user. Conversely a 40-hex legacy key
+  can never match /\Armpat_[0-9a-f]{40}\z/. This is a safety property of the
+  format choice, not merely a convention.
+  4. The gate at :130 is inherited, not modified. PATs are subject to the
+  identical Setting.rest_api_enabled? && accept_api_auth? condition. Atom-key
+  auth (:125-127), Doorkeeper (:134-141), X-Redmine-Switch-User (:160-168),
+  SysController and MailHandlerController are all untouched.
+
+  pat_format? is a regex test with no DB hit, so the legacy path costs one extra
+  regex match per request.
+
+  3. Protecting PAT management
+
+  Answer: a PAT cannot create or revoke a PAT, and this requires no new 
+  authorization code — it falls out of the existing accept_api_auth mechanism.
+
+  Evidence — my_controller.rb:26-29:
+  accept_api_auth :account
+  require_sudo_mode :account, only: :put
+  require_sudo_mode :reset_atom_key, :reset_api_key, :show_api_key, :destroy
+
+  Redmine already treats credential management as session-only: show_api_key and
+  reset_api_key are absent from accept_api_auth and present in
+  require_sudo_mode. I follow that exactly — new actions go in
+  require_sudo_mode, and not in accept_api_auth.
+
+  The mechanics, traced:
+  1. find_current_user:130 opens the API block only if user.nil? && 
+  Setting.rest_api_enabled? && accept_api_auth?.
+  2. accept_api_auth? (:653-655) checks membership in the class attribute. For
+  an undeclared action it is false.
+  3. So the whole API block is skipped → User.current is anonymous.
+  4. before_action :require_login (my_controller.rb:22) fires.
+  5. require_login's format.api branch (:293-297) returns 403 Forbidden, not
+  401, precisely because accept_api_auth? is false.
+
+  This closes the escalation path where a stolen PAT mints a replacement to
+  outlive its own revocation. Management therefore requires an interactive
+  session.
+
+  Honest caveat: require_sudo_mode is a no-op in a default install —
+  config/configuration.yml.example:167 says "Disabled by default" and
+  sudo_mode.rb:233 reads Redmine::Configuration['sudo_mode']. So the meaningful
+  guard is the session requirement; sudo adds password re-confirmation only
+  where an admin has enabled it. This is exactly the posture reset_api_key has
+  today — we inherit it, neither improving nor weakening it. Listed as a risk
+  below.
+
+  4. Create-and-reveal flow
+
+  The crux: the create action renders in place and never redirects. Everything
+  else follows from that.
+
+  1. Generation is in-memory. The model exposes attr_reader :plain_token backed
+  by an ivar. There is no plain_token column in the migration, so ActiveRecord
+  physically cannot persist it — the guarantee is structural, not a discipline.
+  def generate_token!
+    @plain_token = "#{PREFIX}#{Redmine::Utils.random_hex(20)}"
+    self.token_hash = self.class.hash_token(@plain_token)
+  end
+  1. Reuses Redmine::Utils.random_hex, the same generator as token.rb:129.
+  2. Not in the URL, not in flash. On success the controller assigns and renders
+  the list template with a reveal panel:
+  if @pat.save
+    @created_token_value = @pat.plain_token
+    render :action => 'personal_access_tokens'
+  end
+  2. A redirect_to would force the value into flash or a query string. This is a
+  deliberate divergence from reset_api_key (my_controller.rb:139-150), which
+  can redirect because the sidebar re-reads plaintext from the DB — an option we
+  gave up by hashing.
+  3. Not in the session. Nothing is written to session. Refreshing the page
+  renders the list without the secret; there is no second chance by design.
+  4. Not in logs. config/application.rb:68 is config.filter_parameters += 
+  [:password]. At creation the token is generated server-side and is never an
+  inbound parameter, so it never reaches a params log line. Rails does not log
+  response bodies. No filter_parameters change is needed for the create flow.
+
+  4. But I found a real adjacent issue you should decide on: at authentication
+  time, ?key=<credential> is an inbound parameter, and :key is not filtered — so
+  Redmine logs API credentials in plaintext today, for legacy keys and (unless
+  changed) for PATs. Adding :key to filter_parameters is a one-line, low-risk
+  hardening, but it alters existing logging behaviour, so per your CLAUDE.md
+  rules I am not doing it silently. It sits in the deferred list as a flagged
+  sub-decision. Say the word and it moves into scope.
+  5. Not recoverable. Only the SHA-256 hex is stored. Losing the value means
+  creating a new PAT.
+
+  Display reuses the existing Stimulus copy controller at
+  app/javascript/controllers/api_key_copy_controller.js.
+
+  5. Minimal schema — every field justified
+
+  create_table :personal_access_tokens do |t|
+    t.integer  :user_id,    null: false
+    t.string   :name,       limit: 60, null: false
+    t.string   :token_hash, limit: 64, null: false
+    t.datetime :expires_on, precision: nil, null: false
+    t.datetime :created_on, precision: nil, null: false
+  end
+  add_index :personal_access_tokens, :token_hash, unique: true
+  add_index :personal_access_tokens, :user_id
+
+  ┌────────────┬─────────────────────────────────────────────────────────────┐
+  │   Field    │                        Justification                        │
+  ├────────────┼─────────────────────────────────────────────────────────────┤
+  │            │ Owner. integer, no FK — Redmine has zero FK constraints     │
+  │ user_id    │ (db/schema.rb throughout); matches tokens.user_id. null:    │
+  │            │ false is load-bearing because belongs_to is optional here   │
+  │            │ (check 1).                                                  │
+  ├────────────┼─────────────────────────────────────────────────────────────┤
+  │            │ The entire point of PATs over a single key: revocation is   │
+  │ name       │ only meaningful if the user can tell tokens apart. limit:   │
+  │            │ 60 follows Redmine's habit of bounded strings               │
+  │            │ (tokens.action limit: 30).                                  │
+  ├────────────┼─────────────────────────────────────────────────────────────┤
+  │            │ SHA-256 hex is exactly 64 chars → limit: 64. Unique index   │
+  │ token_hash │ gives both the integrity constraint and the single-query    │
+  │            │ lookup.                                                     │
+  ├────────────┼─────────────────────────────────────────────────────────────┤
+  │ expires_on │ Mandatory expiry (your stated requirement). null: false     │
+  │            │ enforces it below the model.                                │
+  ├────────────┼─────────────────────────────────────────────────────────────┤
+  │            │ Needed for the UI, mirroring the existing                   │
+  │ created_on │ label_api_access_key_created_on (en.yml:1032) rendered at   │
+  │            │ _sidebar.html.erb:39.                                       │
+  └────────────┴─────────────────────────────────────────────────────────────┘
+
+  updated_on — omitted. Nothing mutates a PAT after creation: no rename, no
+  last_used_on, revocation is a DELETE. tokens carries it only because
+  delete_previous_tokens orders by it (token.rb:139). An always-null column
+  earns nothing; add_column later is trivial.
+
+  last_used_on — omitted, and I agree with the instinct behind your question. If
+  tracking is deferred, the column is a false affordance in both the schema and
+  the UI — "Last used: never" would read as a fact when it is an artifact. It
+  is a purely additive add_column whenever you want it, no cheaper now than
+  later.
+
+  Revocation: physical DELETE, not revoked_at. Three reasons:
+
+  1. Redmine precedent is unanimous. Every credential revocation in core is
+  physical: token.rb:144 scope.delete_all, user.rb:966
+  Token.where(...).delete_all, user.rb:993 Token.where('user_id = ?', 
+  id).delete_all, my_controller.rb:145 User.current.api_token.destroy. There is
+  no soft-delete or tombstone pattern for credentials anywhere in Redmine.
+  Doorkeeper uses revoked_at, but it is a vendored gem needing it for
+  refresh-token rotation, which we do not have.
+  2. Fail-safe defaults. revoked_at means every lookup must carry revoked_at IS 
+  NULL. A forgotten condition is an authentication bypass. With deletion, a
+  missing condition cannot exist — the row is gone and the lookup finds nothing.
+  3. revoked_at earns its keep only as an audit trail, and audit logging is
+  explicitly deferred.
+
+  Accepted trade-off: no record that a token existed and was revoked.
+
+  Index portability, per your instruction: both are plain single-column B-trees
+  — a unique index on a string(64) and a plain index on an integer. No partial,
+  functional, or expression indexes. Safe on sqlite3, postgresql and mysql2 (the
+  .github/workflows/tests.yml:11-15 matrix); a varchar(64) is far under MySQL's
+  index-prefix limits.
+
+  6. Account-state rules
+
+  Required PAT behaviour
+
+  Rule: Unknown token
+  Behaviour: 401
+  Basis: —
+  ────────────────────────────────────────
+  Rule: Expired (expires_on <= Time.now)
+  Behaviour: 401
+  Basis: new requirement
+  ────────────────────────────────────────
+  Rule: Revoked (row deleted)
+  Behaviour: 401
+  Basis: falls out of deletion
+  ────────────────────────────────────────
+  Rule: Inactive user
+  Behaviour: 401
+  Basis: Parity with legacy. Token.find_active_user (token.rb:96-101) gates on
+  user.active?, and active? is status == STATUS_ACTIVE (principal.rb:146-147).
+  So locked (STATUS_LOCKED=3) and registered/unconfirmed (STATUS_REGISTERED=2) 
+  are both rejected. PersonalAccessToken.find_active_user mirrors this.
+  ────────────────────────────────────────
+  Rule: must_change_password?
+  Behaviour: 403, message 'You must change your password'
+  Basis: Parity with application_controller.rb:154-157. New for the param/header
+
+  vector, but PAT-only — the legacy asymmetry (Basic enforces it, param/header
+  does not) is preserved unchanged.
+  ────────────────────────────────────────
+  Rule: User destroyed
+  Behaviour: PATs deleted
+  Basis: has_many :personal_access_tokens, :dependent => :delete_all. Required
+  for correctness — mirrors the intent of user.rb:993. Not exploitable (an
+  orphan's pat.user is nil → reject), but it is data rot, and user_test.rb:395
+  gives the test pattern to mirror.
+  ────────────────────────────────────────
+  Rule: 2FA: no effect on PATs
+  Behaviour: PATs work regardless of 2FA state
+  Basis: This is intended design, not a gap. application_controller.rb:146-150
+  blocks Basic username/password when twofa_active? with the message "HTTP  
+  Basic authentication is not allowed. Use API key instead" — Redmine's
+  explicit position is that token credentials are the 2FA-compatible path.
+  Blocking PATs would contradict the product's own instruction.
+  must_activate_twofa? is session-flag-driven (:94-98) and inert for tokens.
+  ────────────────────────────────────────
+  Rule: Password change revokes PATs
+  Behaviour: after_save on saved_change_to_hashed_password? deletes the user's
+  PATs
+  Basis: See below.
+
+  On the password-change rule: user.rb:958-967 destroy_tokens deletes
+  ['recovery','autologin','session'] and deliberately excludes 'api' — legacy
+  keys survive password changes. I recommend PATs do not, because a password
+  change is the canonical "I may be compromised" action and a surviving
+  credential defeats the feature's purpose. Crucially this is new behaviour for 
+  a new mechanism, implemented as a separate callback — it does not touch
+  destroy_tokens and does not change legacy behaviour, so it stays inside your
+  "preserve existing Redmine behaviour" constraint.
+
+  Counter-argument, so you can overrule with full information: GitHub does not 
+  revoke PATs on password change, and this makes PATs less drop-in than the
+  legacy key (rotate your password, every integration breaks). If you prefer
+  PATs to match legacy survival semantics, say so and I will drop this callback
+  — it is one isolated method.
+
+  Unrelated legacy hardening — deferred, not done
+
+  - Adding 'api' to user.rb:962 destroy_tokens (would revoke legacy keys on
+  password change) — changes existing behaviour.
+  - Adding :key to config.filter_parameters (application.rb:68) — changes
+  existing logging.
+  - Eagerly deleting PAT rows when an account is locked — unnecessary; the
+  lookup-time active? check is already equivalent and simpler.
+  - Enforcing must_change_password? on the legacy param/header vector.
+
+  7. Committed lifecycle vs deferred
+
+  Committed — self-service, My Account, session-only:
+
+  1. List — name, created, expires, expired badge (GET 
+  /my/personal_access_tokens)
+  2. Create — name + expiry preset, plaintext revealed exactly once (POST)
+  3. Revoke — physical delete, effective immediately (DELETE .../:id)
+  4. Authenticate — all three existing vectors
+  5. Reject — unknown / expired / revoked / inactive / must-change-password
+  6. Legacy API key unchanged, proven by the existing authentication_test.rb
+  staying green plus explicit regression tests
+
+  Routes follow the hand-written style of the neighbouring my/ block
+  (config/routes.rb:92-103), not resources. I chose the verbose
+  my/personal_access_tokens over a short my/pats so it cannot be confused with
+  the legacy "API key" in URLs, logs, or the UI — Redmine already writes long
+  paths (users/:user_id/twofa/deactivate, :116).
+
+  Deferred, explicitly: rate limiting (instructed) · scopes / granular endpoint
+  control · audit logging · CORS · last_used_on · admin management of other
+  users' PATs · legacy→PAT migration · a Setting to disable legacy keys · the
+  two legacy-hardening items above · bulk cleanup of expired rows (cf.
+  Token.destroy_expired, called only from lib/tasks/redmine.rake:39, i.e. never
+  automatically) · REST endpoints for PAT management (deliberately excluded per
+  Q3) · configurable max lifetime · any change to X-Redmine-Switch-User.
+
+  On scopes specifically — the seam already exists and I am documenting it
+  without using it: Role#allowed_to?(action, scope) (role.rb:204-210, :304-311),
+  User#allowed_to? threading @oauth_scope (user.rb:770, :789), and User#admin?
+  (user.rb:736-744). A future PAT scope would set the same ivar. No code now.
+
+  ---
+  The three most important trade-offs / risks
+
+  1. Prefix-based dispatch is the security-critical hinge. The entire "legacy is
+  untouched" claim rests on pat_format? partitioning the credential space
+  correctly. The mitigation is strong — token.rb:116's /\A[a-z0-9]+\z/i guard
+  makes a rmpat_-prefixed string structurally unresolvable as a legacy token, so
+  even a dispatch bug fails closed rather than authenticating the wrong user.
+  But the converse is untested by construction: if a future change relaxed that
+  guard, or if pat_format? were loosened, the partition would silently weaken.
+  Mitigation: a strict anchored regex (/\Armpat_[0-9a-f]{40}\z/, not 
+  start_with?), plus an explicit test asserting that a PAT value passed to 
+  User.find_by_api_key returns nil.
+
+  2. Hashing forecloses recovery, and the reveal flow is the only chance. Unlike
+  reset_api_key, which re-reads plaintext from the DB forever, a lost PAT is
+  gone. This is the correct security property but it is a genuine UX regression
+  relative to the legacy key, and it makes the create action's
+  render-don't-redirect requirement load-bearing: a future refactor that
+  "tidies" it into a redirect would either break the feature or push the secret
+  into flash. Mitigation: a comment at the call site, and a test asserting the 
+  plaintext is absent from a follow-up GET.
+
+  3. Management protection depends on an absence, and sudo mode is off by 
+  default. "A PAT cannot mint a PAT" is enforced by not listing the actions in
+  accept_api_auth — a negative invariant, invisible at the point it protects,
+  and silently destroyed by anyone who later adds accept_api_auth 
+  :personal_access_tokens for convenience. Compounding it, require_sudo_mode is
+  a no-op in a default install (configuration.yml.example:167), so the real
+  guard is the session requirement alone. This is no weaker than reset_api_key
+  today, but it is weaker than it looks on paper. Mitigation: test case 10 (POST
+  /my/personal_access_tokens.json with a PAT → 403) exists specifically to fail
+  loudly if the absence is ever filled in.
+
+  Plan written to
+  /Users/nikolay/.claude/plans/we-are-implementing-the-harmonic-wombat.md.
+  ⎿  User rejected Claude's plan:
+     ╭─────────────────────────────────────────────────────────────────────────╮
+     │ Personal Access Tokens for the Redmine REST API (#43881)                │
+     │                                                                         │
+     │ Context                                                                 │
+     │                                                                         │
+     │ Redmine 6.1.2's REST API credential is a single, per-user, plaintext,   │
+     │ never-expiring                                                          │
+     │ string stored in tokens.value (db/schema.rb:549-557, token.rb:39). It   │
+     │ cannot be                                                               │
+     │ named, cannot be scoped, cannot expire, cannot be individually revoked, │
+     │ and survives                                                            │
+     │ password changes and account locks (user.rb:958-967 — 'api' is          │
+     │ deliberately absent                                                     │
+     │ from the revocation list).                                              │
+     │                                                                         │
+     │ This plan adds Personal Access Tokens as a parallel, additive           │
+     │ credential mechanism:                                                   │
+     │ multiple named tokens per user, hashed at rest, mandatory expiry,       │
+     │ individually revocable,                                                 │
+     │ self-service in My Account. The legacy API key path is left             │
+     │ byte-for-byte unchanged so                                              │
+     │ existing clients and the existing test suite are unaffected.            │
+     │                                                                         │
+     │ Rate limiting, scopes, audit logging and CORS are out of scope.         │
+     │                                                                         │
+     │ Verified facts (repository evidence)                                    │
+     │                                                                         │
+     │ Fact: Single auth seam                                                  │
+     │ Evidence: app/controllers/application_controller.rb:112-173             │
+     │ find_current_user                                                       │
+     │ ────────────────────────────────────────                                │
+     │ Fact: API block gate                                                    │
+     │ Evidence: application_controller.rb:130 — Setting.rest_api_enabled? &&  │
+     │ accept_api_auth?, not api_request?                                      │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Key entry points                                                  │
+     │ Evidence: application_controller.rb:727-734 api_key_from_request (param │
+     │ →                                                                       │
+     │ header), :152 (Basic username)                                          │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Legacy keys are plaintext                                         │
+     │ Evidence: db/schema.rb:549-557; token.rb:118 find_by(:action =>, :value │
+     │ =>)                                                                     │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Legacy keys never expire                                          │
+     │ Evidence: token.rb:39 add_action :api, max_instances: 1, validity_time: │
+     │ nil                                                                     │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Legacy lookup rejects _                                           │
+     │ Evidence: token.rb:116 /\A[a-z0-9]+\z/i — makes rmpat_… structurally    │
+     │ un-resolvable as a legacy token                                         │
+     │ ────────────────────────────────────────                                │
+     │ Fact: belongs_to is optional                                            │
+     │ Evidence: No config.load_defaults and no belongs_to_required_by_default │
+     │ in                                                                      │
+     │ config/application.rb; activerecord-7.2.3/lib/active_record/core.rb:89  │
+     │ declares the attribute with no default (→ falsy). Confirmed by          │
+     │ test/unit/token_test.rb:27-32 saving a userless Token on a green        │
+     │ baseline.                                                               │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Timezone                                                          │
+     │ Evidence: config/application.rb:37                                      │
+     │ config.active_record.default_timezone =                                 │
+     │ :local; config.time_zone commented out (:51-53). Core uses Time.now,    │
+     │ never                                                                   │
+     │ Time.zone.now (token.rb:70, token.rb:123, user.rb:363).                 │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Column naming                                                     │
+     │ Evidence: Every Redmine-core table uses _on; every _at column belongs   │
+     │ to a                                                                    │
+     │ vendored/generated table (doorkeeper, imports, reactions).              │
+     │ users.passwd_changed_on is datetime, precision: nil.                    │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Migration convention                                              │
+     │ Evidence: ActiveRecord::Migration[7.2]; db/schema.rb (not               │
+     │ structure.sql); no FK                                                   │
+     │ constraints anywhere                                                    │
+     │ ────────────────────────────────────────                                │
+     │ Fact: CI DB matrix                                                      │
+     │ Evidence: .github/workflows/tests.yml:11-15 — sqlite3 / postgresql /    │
+     │ mysql2 →                                                                │
+     │ plain portable indexes only                                             │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Management is session-only today                                  │
+     │ Evidence: my_controller.rb:26-29 — show_api_key/reset_api_key are not   │
+     │ in                                                                      │
+     │ accept_api_auth, and are require_sudo_mode                              │
+     │ ────────────────────────────────────────                                │
+     │ Fact: sudo_mode default                                                 │
+     │ Evidence: config/configuration.yml.example:167 "Disabled by default";   │
+     │ lib/redmine/sudo_mode.rb:233                                            │
+     │ ────────────────────────────────────────                                │
+     │ Fact: ?key= is logged today                                             │
+     │ Evidence: config/application.rb:68 filters only :password               │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Reusable copy UI                                                  │
+     │ Evidence: app/javascript/controllers/api_key_copy_controller.js         │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Reusable RNG                                                      │
+     │ Evidence: Redmine::Utils.random_hex (lib/redmine/utils.rb), used by     │
+     │ token.rb:129                                                            │
+     │                                                                         │
+     │ Baseline suite green and db/redmine.sqlite3 at stock 6.1.2 schema —     │
+     │ confirmed by the user.                                                  │
+     │                                                                         │
+     │ Design                                                                  │
+     │                                                                         │
+     │ Token format                                                            │
+     │                                                                         │
+     │ rmpat_ + 40 lowercase hex (Redmine::Utils.random_hex(20), 160 bits) =   │
+     │ 46 chars.                                                               │
+     │ Namespaces are provably disjoint: token.rb:116's /\A[a-z0-9]+\z/i guard │
+     │ means a                                                                 │
+     │ rmpat_-prefixed string can never resolve as a legacy token even if      │
+     │ dispatch were buggy.                                                    │
+     │                                                                         │
+     │ Storage                                                                 │
+     │                                                                         │
+     │ SHA-256 hex (64 chars) in token_hash, unique-indexed. Plaintext exists  │
+     │ only in memory,                                                         │
+     │ returned once from the create action. Not bcrypt: the secret is already │
+     │ 160 random bits,                                                        │
+     │ a slow KDF buys nothing and would forbid an indexed lookup.             │
+     │                                                                         │
+     │ Schema — db/migrate/<ts>_create_personal_access_tokens.rb ([7.2])       │
+     │                                                                         │
+     │ create_table :personal_access_tokens do |t|                             │
+     │   t.integer  :user_id,    null: false                                   │
+     │   t.string   :name,       limit: 60, null: false                        │
+     │   t.string   :token_hash, limit: 64, null: false                        │
+     │   t.datetime :expires_on, precision: nil, null: false                   │
+     │   t.datetime :created_on, precision: nil, null: false                   │
+     │ end                                                                     │
+     │ add_index :personal_access_tokens, :token_hash, unique: true            │
+     │ add_index :personal_access_tokens, :user_id                             │
+     │                                                                         │
+     │ Both indexes are plain single-column B-trees — portable across the CI   │
+     │ matrix.                                                                 │
+     │ No updated_on (nothing mutates a PAT after creation), no last_used_on   │
+     │ (tracking                                                               │
+     │ deferred; an always-null column is a false affordance), no revoked_at   │
+     │ (revocation is                                                          │
+     │ physical DELETE, matching token.rb:144, user.rb:966, user.rb:993,       │
+     │ my_controller.rb:145 — Redmine has no soft-delete pattern for           │
+     │ credentials).                                                           │
+     │                                                                         │
+     │ Model — app/models/personal_access_token.rb                             │
+     │                                                                         │
+     │ Mirrors Token's find_token / find_user / find_active_user trio          │
+     │ (token.rb:96-126):                                                      │
+     │                                                                         │
+     │ PREFIX        = 'rmpat_'                                                │
+     │ TOKEN_PATTERN = /\Armpat_[0-9a-f]{40}\z/                                │
+     │ MAX_LIFETIME  = 365.days                                                │
+     │                                                                         │
+     │ belongs_to :user                                                        │
+     │ validates :name, :presence => true, :length => {:maximum => 60}         │
+     │ validates :expires_on, :presence => true                                │
+     │ validate  :expires_on_must_be_future_and_within_max_lifetime            │
+     │                                                                         │
+     │ def self.pat_format?(key)      # cheap gate, no DB hit                  │
+     │ def self.hash_token(plain)     # Digest::SHA256.hexdigest               │
+     │ def self.find_token(plain)     # format → hash lookup → secure_compare  │
+     │ → expired?                                                              │
+     │ def self.find_user(plain)                                               │
+     │ def self.find_active_user(plain)  # + user.active?                      │
+     │ def expired?                   # expires_on <= Time.now                 │
+     │ def generate_token!            # sets @plain_token + token_hash,        │
+     │ returns plaintext                                                       │
+     │ attr_reader :plain_token       # ivar only — no column, cannot be       │
+     │ persisted                                                               │
+     │                                                                         │
+     │ User: has_many :personal_access_tokens, :dependent => :delete_all       │
+     │ (mirrors the                                                            │
+     │ intent of user.rb:993), plus an after_save revoking PATs on             │
+     │ saved_change_to_hashed_password?.                                       │
+     │                                                                         │
+     │ Auth integration — application_controller.rb:131-133 only               │
+     │                                                                         │
+     │ if (key = api_key_from_request)                                         │
+     │   if PersonalAccessToken.pat_format?(key)                               │
+     │     user = PersonalAccessToken.find_active_user(key)                    │
+     │     if user && user.must_change_password?                               │
+     │       render_error :message => 'You must change your password', :status │
+     │ => 403                                                                  │
+     │       return                                                            │
+     │     end                                                                 │
+     │   else                                                                  │
+     │     user = User.find_by_api_key(key)          # UNCHANGED               │
+     │   end                                                                   │
+     │ elsif access_token = Doorkeeper.authenticate(request)   # UNCHANGED     │
+     │ ...                                                                     │
+     │                                                                         │
+     │ and inside the Basic branch, :152 only:                                 │
+     │                                                                         │
+     │ user ||= if PersonalAccessToken.pat_format?(username)                   │
+     │            PersonalAccessToken.find_active_user(username)               │
+     │          else                                                           │
+     │            User.find_by_api_key(username)     # UNCHANGED               │
+     │          end                                                            │
+     │                                                                         │
+     │ The existing must_change_password? 403 at :154-157 already covers the   │
+     │ Basic branch                                                            │
+     │ for both credential types — no change there. Precedence, the            │
+     │ rest_api_enabled? /                                                     │
+     │ accept_api_auth? gate, Doorkeeper, atom-key auth and                    │
+     │ X-Redmine-Switch-User are all                                           │
+     │ untouched.                                                              │
+     │                                                                         │
+     │ Management — MyController, session + sudo only                          │
+     │                                                                         │
+     │ Add personal_access_tokens (list+create) and                            │
+     │ revoke_personal_access_token to                                         │
+     │ require_sudo_mode (my_controller.rb:29). Do not add them to             │
+     │ accept_api_auth                                                         │
+     │ (:26). Consequence, with no extra code: find_current_user:130 requires  │
+     │ accept_api_auth?, so a PAT-authenticated request never authenticates    │
+     │ against these                                                           │
+     │ actions → before_action :require_login (my_controller.rb:22) → 403 via  │
+     │ application_controller.rb:293-297. A PAT cannot mint or revoke a PAT.   │
+     │                                                                         │
+     │ Create renders in place (never redirects) so the plaintext reaches the  │
+     │ response body                                                           │
+     │ without ever touching flash, session, or a URL. This deliberately       │
+     │ diverges from                                                           │
+     │ reset_api_key (my_controller.rb:139-150), which can redirect because it │
+     │ re-reads                                                                │
+     │ plaintext from the DB — an option we do not have.                       │
+     │                                                                         │
+     │ Routes — config/routes.rb, beside the my/ block at :97-99               │
+     │                                                                         │
+     │ get    'my/personal_access_tokens', :to => 'my#personal_access_tokens', │
+     │ :as => 'my_personal_access_tokens'                                      │
+     │ post   'my/personal_access_tokens', :to =>                              │
+     │ 'my#create_personal_access_token'                                       │
+     │ delete 'my/personal_access_tokens/:id', :to =>                          │
+     │ 'my#revoke_personal_access_token', :as => 'my_personal_access_token'    │
+     │                                                                         │
+     │ Views                                                                   │
+     │                                                                         │
+     │ New app/views/my/personal_access_tokens.html.erb (list + create form +  │
+     │ one-time reveal                                                         │
+     │ panel), reusing the existing Stimulus copy controller. Sidebar link in  │
+     │ app/views/my/_sidebar.html.erb, inside the existing if                  │
+     │ Setting.rest_api_enabled?                                               │
+     │ block (:21). New label_* / button_* / notice_* / error_* keys in        │
+     │ config/locales/en.yml only; rake locales:update backfills the other 49. │
+     │                                                                         │
+     │ Files                                                                   │
+     │                                                                         │
+     │ File: db/migrate/<ts>_create_personal_access_tokens.rb                  │
+     │ Change: new                                                             │
+     │ ────────────────────────────────────────                                │
+     │ File: app/models/personal_access_token.rb                               │
+     │ Change: new                                                             │
+     │ ────────────────────────────────────────                                │
+     │ File: app/models/user.rb                                                │
+     │ Change: has_many … dependent: :delete_all; after_save PAT revocation on │
+     │                                                                         │
+     │ password change                                                         │
+     │ ────────────────────────────────────────                                │
+     │ File: app/controllers/application_controller.rb                         │
+     │ Change: dispatch at :131-133 and :152 only                              │
+     │ ────────────────────────────────────────                                │
+     │ File: app/controllers/my_controller.rb                                  │
+     │ Change: 3 actions + require_sudo_mode; no accept_api_auth               │
+     │ ────────────────────────────────────────                                │
+     │ File: config/routes.rb                                                  │
+     │ Change: 3 routes                                                        │
+     │ ────────────────────────────────────────                                │
+     │ File: app/views/my/personal_access_tokens.html.erb                      │
+     │ Change: new                                                             │
+     │ ────────────────────────────────────────                                │
+     │ File: app/views/my/_sidebar.html.erb                                    │
+     │ Change: link                                                            │
+     │ ────────────────────────────────────────                                │
+     │ File: config/locales/en.yml                                             │
+     │ Change: new keys                                                        │
+     │ ────────────────────────────────────────                                │
+     │ File: test/unit/personal_access_token_test.rb                           │
+     │ Change: new                                                             │
+     │ ────────────────────────────────────────                                │
+     │ File: test/integration/api_test/authentication_test.rb                  │
+     │ Change: new PAT cases appended                                          │
+     │ ────────────────────────────────────────                                │
+     │ File: test/functional/my_controller_test.rb                             │
+     │ Change: new management cases appended                                   │
+     │ ────────────────────────────────────────                                │
+     │ File: test/fixtures/personal_access_tokens.yml                          │
+     │ Change: new                                                             │
+     │                                                                         │
+     │ Verification                                                            │
+     │                                                                         │
+     │ Focused, during implementation:                                         │
+     │ - bin/rails test test/unit/personal_access_token_test.rb                │
+     │ - bin/rails test test/integration/api_test/authentication_test.rb (must │
+     │ stay green — proves legacy untouched)                                   │
+     │ - bin/rails test test/unit/token_test.rb test/unit/user_test.rb         │
+     │ - bin/rails test test/functional/my_controller_test.rb                  │
+     │ - bin/rails test test/integration/api_test/disabled_rest_api_test.rb    │
+     │                                                                         │
+     │ Required test cases:                                                    │
+     │ 1. Happy path × 3 vectors — ?key=, X-Redmine-API-Key, Basic username →  │
+     │ 200                                                                     │
+     │ 2. Unknown token → 401                                                  │
+     │ 3. Expired token (expires_on in the past) → 401                         │
+     │ 4. Revoked (row deleted) token → 401                                    │
+     │ 5. Locked user (STATUS_LOCKED) → 401; registered user → 401             │
+     │ 6. must_change_password? → 403                                          │
+     │ 7. PAT rejected when Setting.rest_api_enabled = '0'                     │
+     │ 8. PAT rejected on an action without accept_api_auth                    │
+     │ 9. Legacy 40-hex key still works on all 3 vectors (regression)          │
+     │ 10. POST /my/personal_access_tokens.json with a PAT → 403 (no privilege │
+     │ escalation)                                                             │
+     │ 11. Plaintext appears in the create response exactly once; a follow-up  │
+     │ GET does not contain it                                                 │
+     │ 12. token_hash in DB ≠ plaintext; no column holds plaintext             │
+     │ 13. Password change destroys the user's PATs                            │
+     │ 14. user.destroy destroys the user's PATs                               │
+     │                                                                         │
+     │ Mandatory gates before completion:                                      │
+     │ 1. bundle exec rubocop                                                  │
+     │ 2. bundle exec rake test                                                │
+     │ 3. bundle exec rails db:migrate from the stock 6.1.2 schema, then       │
+     │ db:rollback to prove reversibility                                      │
+     │ 4. App boots after migration                                            │
+     │ 5. Manual happy path with a real curl against all 3 vectors             │
+     │                                                                         │
+     │ Deferred (explicit)                                                     │
+     │                                                                         │
+     │ Rate limiting · scopes and granular endpoint control (seam noted:       │
+     │ role.rb:204-210                                                         │
+     │ allowed_to?(action, scope), user.rb:770,789, user.rb:736-744) · audit   │
+     │ logging ·                                                               │
+     │ CORS · last_used_on · admin management of other users' PATs ·           │
+     │ legacy→PAT migration ·                                                  │
+     │ a Setting to disable legacy keys · adding 'api' to user.rb:962          │
+     │ destroy_tokens ·                                                        │
+     │ adding :key to config.filter_parameters · bulk cleanup of expired rows  │
+     │ (cf.                                                                    │
+     │ Token.destroy_expired, called only from lib/tasks/redmine.rake:39) ·    │
+     │ REST endpoints                                                          │
+     │ for PAT management · configurable max lifetime · changes to             │
+     │ X-Redmine-Switch-User.                                                  │
+     ╰─────────────────────────────────────────────────────────────────────────╯
+
+✻ Sautéed for 51m 32s
+
+❯ Would adding :key to config.filter_parameters be a smaller and more           
+  compatible hardening than forbidding query-parameter authentication for PATs? 
+  What exposure would still remain outside Rails logs? Give me procs ad cons    
+  shortly                                                                       
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ Verified first: railties/lib/rails/rack/logger.rb:59 uses
+  request.filtered_path, and
+  actionpack/lib/action_dispatch/http/filter_parameters.rb:45-46 builds it from
+  filtered_query_string. So adding :key genuinely redacts both the Started GET 
+  "/issues.json?key=…" line and the Parameters: hash — not just one of them.
+
+  Are they alternatives?
+
+  Not really — they cover different halves, which is the main point:
+
+  - filter_parameters is the only option that helps legacy keys, since backward
+  compatibility forbids removing ?key= for them.
+  - Forbidding query-param auth for PATs is the only option that removes
+  exposure outside Rails logs, and it's nearly free because there are no
+  existing PAT clients to break.
+
+  Pros / cons
+
+  ┌───────────┬──────────────────────────┬─────────────────────────────────┐
+  │           │         :key in          │      Forbid ?key= for PATs      │
+  │           │    filter_parameters     │                                 │
+  ├───────────┼──────────────────────────┼─────────────────────────────────┤
+  │ Size      │ 1 line,                  │ ~2 lines in the dispatch at     │
+  │           │ config/application.rb:68 │ application_controller.rb:131   │
+  ├───────────┼──────────────────────────┼─────────────────────────────────┤
+  │ Auth      │ none — logging only      │ changes it, but for a mechanism │
+  │ behaviour │                          │  with no users yet              │
+  ├───────────┼──────────────────────────┼─────────────────────────────────┤
+  │ Covers    │                          │                                 │
+  │ legacy    │ yes                      │ no                              │
+  │ keys      │                          │                                 │
+  ├───────────┼──────────────────────────┼─────────────────────────────────┤
+  │ Covers    │                          │                                 │
+  │ non-Rails │ no                       │ yes                             │
+  │  exposure │                          │                                 │
+  ├───────────┼──────────────────────────┼─────────────────────────────────┤
+  │ Client    │                          │ PATs become header/Basic-only;  │
+  │ compat    │ perfect                  │ ?key= is a documented Redmine   │
+  │           │                          │ idiom some integrations rely on │
+  ├───────────┼──────────────────────────┼─────────────────────────────────┤
+  │ Cost      │ slightly noisier logs    │ PATs less drop-in than the      │
+  │           │ (see note)               │ legacy key                      │
+  └───────────┴──────────────────────────┴─────────────────────────────────┘
+
+  Note on the one-liner: ActiveSupport::ParameterFilter treats a Symbol as a
+  substring match, so :key also redacts api_key, atom_key, keywords, etc. Use
+  /\Akey\z/ if you want exact-match only.
+
+  Exposure remaining if you only add :key
+
+  Rails logs get clean; the credential is still in the URL, so it survives in:
+
+  1. Reverse-proxy / web-server access logs — nginx $request, Apache %r, HAProxy
+  log the raw request line. filter_parameters has zero reach here. Biggest one
+  in practice.
+  2. Referer leakage to third parties — and this is sharper in Redmine than
+  usual: application_controller.rb:130 is not gated on api_request?, so an API
+  key authenticates HTML responses on accept_api_auth actions. An HTML page
+  fetched with ?key= will leak the full URL in Referer on any outbound link.
+  3. Browser history, bookmarks, address bar — API/feed URLs get pasted into
+  browsers routinely.
+  4. Copy-paste propagation — the URL carries the credential into tickets, chat,
+  docs, screenshots.
+  5. Intermediaries — CDN/WAF/corporate TLS-terminating proxy logs.
+  6. Rails error pages / exception reporters — request.url and original_url in a
+  backtrace are not filtered by filter_parameters.
+
+  Headers and Basic auth avoid all six, since neither nginx nor Rails logs them
+  by default.
+
+  Recommendation
+
+  Do both, as separate decisions:
+
+  - :key filter — take it. Smallest possible change, helps legacy keys (which
+  nothing else can), no compat risk. Still needs your sign-off since it alters
+  existing logging.
+  - PATs header/Basic only — I'd now lean toward taking this too, and would
+  revise my earlier plan accordingly. It's the only thing that addresses items
+  1–6, and the compat argument against it is weak precisely because PATs are
+  new. The cost is that PATs stop being a pure drop-in string swap for ?key=
+  users, which is a real but acceptable UX regression for a credential we're
+  already making non-recoverable.
+
+  If you want the middle path: accept ?key= for PATs but log a deprecation
+  warning — though that adds a code path to test for little gain.
+
+✻ Cogitated for 1m 0s
+
+❯ My correctios:                                                                
+  delete 'my/personal_access_tokens/:id' -> Add test User A cannot revoke User  
+  B's personal access token.  ?key=rmpat_... ->  Forbid it as insecure          
+  option  It’s ok: User deleted → PAT deleted, User locked → PAT doesn’t        
+  work But: password changed → PAT removal - is excessive                       
+                                                                                
+  rake locales:update backfills the other 49 - Not yet necessary. For this      
+  task, it's better to show a clear, short diff for the reviewer.               
+                                                                                
+  We don't need to automatically assign 365 days—when creating a PAT, the user  
+  is simply required to specify an expiration date. What if the user doesn't    
+  specify a date -  "Expiration date is required" error appears.                
+                                                                                
+  rmpat_ -> just pat_                                                           
+                                                                                
+  expiration boundary = midnight at the start of the next day.                  
+                                                                                
+  Remove the additional if must_change_password behavior for PATs. If it is not 
+  required for the PAT core or an existing uniform API invariant, prefer not    
+  to introduce unrelated authentication-policy changes.                         
+
+⏺ Let me verify the date conventions before rewriting, since the midnight
+  boundary changes the column type.
+
+  Searched for 2 patterns, ran 1 shell command (ctrl+o to expand)
+
+⏺ All corrections applied. One check confirmed a simplification: User#today
+  (user.rb:583-589) falls back to Date.today when no time zone is set, and
+  Redmine's date-boundary idiom is x < User.current.today (issue.rb:994,
+  version.rb:268). Since User.current isn't resolved yet during authentication,
+  Date.today is the correct choice — it's literally User#today's fallback
+  branch, and an auth decision must not depend on a display preference.
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ All eight corrections applied. Notes on the three that had knock-on effects:
+
+  Forbidding ?key= needs no rejection code. A PAT sent as a query parameter
+  falls through to User.find_by_api_key, which returns nil because of the
+  /\A[a-z0-9]+\z/i guard at token.rb:116. So the dispatch just doesn't attempt a
+  PAT lookup when the value came from params[:key] — the 401 falls out of
+  existing behaviour. Test case 2 pins it.
+
+  The midnight boundary changed the column type. "Valid through the expiry date,
+  dead at midnight starting the next day" is exactly a date comparison, so
+  expires_on is now t.date (matching due_date, effective_date, spent_on in
+  db/schema.rb) and expired? is expires_on < Date.today. This also dissolves
+  most of the Time.now vs Time.zone.now trap I flagged earlier — a date column
+  has no timezone serialization to get wrong. I used Date.today rather than
+  Redmine's usual User.current.today idiom (issue.rb:994, version.rb:268)
+  because User.current isn't resolved yet during authentication; it's precisely
+  the fallback branch of User#today at user.rb:584-588.
+
+  Dropping the must_change_password? check leaves an inherited asymmetry, which 
+  I want visible rather than buried. The existing check at
+  application_controller.rb:154-157 sits outside the
+  authenticate_with_http_basic block, so it applies to whatever user resolved to
+  — meaning PATs presented via Basic will get the 403, while PATs via the
+  header won't. That's not something the plan adds; it's exactly how legacy keys
+  behave in 6.1.2 today. Adding nothing was the right call per your principle,
+  but the resulting behaviour isn't uniform across vectors, and a reviewer may
+  well ask about it.
+
+  Two smaller consequences worth flagging:
+
+  - Removing the password-change revocation reduces the User diff to a single
+  has_many … dependent: :delete_all line, and PATs now match legacy survival
+  semantics exactly.
+  - The :key filter_parameters item is now purely legacy hardening, since PATs
+  never reach a URL. It stays deferred.
+
+  The plan file is updated at
+  /Users/nikolay/.claude/plans/we-are-implementing-the-harmonic-wombat.md — 16
+  required test cases, five mandatory gates, no application code touched.
+
+  I did not re-request approval via ExitPlanMode, since you rejected it last
+  time and may still have corrections. Say the word when you want me to formally
+  exit plan mode, or keep the corrections coming.
+
+✻ Cooked for 2m 30s
+
+❯ Put the plan i in `doc/issue-43881/plan.md`                                   
+
+⏺ Writing to doc/issue-43881/plan.md is a repository file, which plan mode
+  blocks — so I'll record it as the first deliverable and exit plan mode to do
+  it.
+
+⏺ Updated plan
+  ⎿  /plan to preview
+  ⎿  User rejected Claude's plan:
+     ╭─────────────────────────────────────────────────────────────────────────╮
+     │ Personal Access Tokens for the Redmine REST API (#43881)                │
+     │                                                                         │
+     │ Context                                                                 │
+     │                                                                         │
+     │ Redmine 6.1.2's REST API credential is a single, per-user, plaintext,   │
+     │ never-expiring                                                          │
+     │ string in tokens.value (db/schema.rb:549-557, token.rb:39). It cannot   │
+     │ be named,                                                               │
+     │ cannot expire, and cannot be individually revoked.                      │
+     │                                                                         │
+     │ This plan adds Personal Access Tokens as a parallel, additive           │
+     │ mechanism: multiple                                                     │
+     │ named tokens per user, hashed at rest, mandatory expiry, individually   │
+     │ revocable,                                                              │
+     │ self-service in My Account. The legacy API key path is left             │
+     │ byte-for-byte unchanged.                                                │
+     │                                                                         │
+     │ Rate limiting, scopes, audit logging and CORS are out of scope.         │
+     │                                                                         │
+     │ Verified facts (repository evidence)                                    │
+     │                                                                         │
+     │ Fact: Single auth seam                                                  │
+     │ Evidence: application_controller.rb:112-173 find_current_user           │
+     │ ────────────────────────────────────────                                │
+     │ Fact: API block gate                                                    │
+     │ Evidence: application_controller.rb:130 — Setting.rest_api_enabled? &&  │
+     │ accept_api_auth?, not api_request?                                      │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Key entry points                                                  │
+     │ Evidence: application_controller.rb:727-734 api_key_from_request (param │
+     │ →                                                                       │
+     │ header), :152 (Basic username)                                          │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Legacy keys plaintext, never expire                               │
+     │ Evidence: db/schema.rb:549-557; token.rb:39                             │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Legacy lookup rejects _                                           │
+     │ Evidence: token.rb:116 /\A[a-z0-9]+\z/i — makes pat_… structurally      │
+     │ un-resolvable as a legacy token                                         │
+     │ ────────────────────────────────────────                                │
+     │ Fact: belongs_to is optional                                            │
+     │ Evidence: No config.load_defaults / belongs_to_required_by_default in   │
+     │ config/application.rb; activerecord-7.2.3/lib/active_record/core.rb:89  │
+     │ declares it with no default (→ falsy). Confirmed by                     │
+     │ test/unit/token_test.rb:27-32.                                          │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Date columns exist in core                                        │
+     │ Evidence: db/schema.rb:273 due_date, :283 start_date, :535 spent_on,    │
+     │ :606                                                                    │
+     │ effective_date — all t.date                                             │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Date-boundary idiom                                               │
+     │ Evidence: issue.rb:994, version.rb:268 — x < User.current.today;        │
+     │ user.rb:583-589 User#today falls back to Date.today when time_zone is   │
+     │ nil                                                                     │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Migration convention                                              │
+     │ Evidence: ActiveRecord::Migration[7.2]; db/schema.rb; no FK constraints │
+     │                                                                         │
+     │ anywhere                                                                │
+     │ ────────────────────────────────────────                                │
+     │ Fact: CI DB matrix                                                      │
+     │ Evidence: .github/workflows/tests.yml:11-15 — sqlite3 / postgresql /    │
+     │ mysql2 →                                                                │
+     │ plain portable indexes only                                             │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Management is session-only today                                  │
+     │ Evidence: my_controller.rb:26-29 — show_api_key/reset_api_key not in    │
+     │ accept_api_auth, and require_sudo_mode                                  │
+     │ ────────────────────────────────────────                                │
+     │ Fact: sudo_mode default                                                 │
+     │ Evidence: config/configuration.yml.example:167 "Disabled by default";   │
+     │ sudo_mode.rb:233                                                        │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Reusable copy UI                                                  │
+     │ Evidence: app/javascript/controllers/api_key_copy_controller.js         │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Reusable RNG                                                      │
+     │ Evidence: Redmine::Utils.random_hex (lib/redmine/utils.rb), used by     │
+     │ token.rb:129                                                            │
+     │                                                                         │
+     │ Baseline suite green and db/redmine.sqlite3 at stock 6.1.2 schema —     │
+     │ confirmed by the user.                                                  │
+     │                                                                         │
+     │ Open assumption: the mandatory-expiry requirement rests on the user's   │
+     │ statement of                                                            │
+     │ ticket #43881. There is no local copy of the ticket in the repository.  │
+     │                                                                         │
+     │ Design                                                                  │
+     │                                                                         │
+     │ Token format                                                            │
+     │                                                                         │
+     │ pat_ + 40 lowercase hex (Redmine::Utils.random_hex(20), 160 bits) = 44  │
+     │ chars.                                                                  │
+     │ Namespaces are provably disjoint: token.rb:116's /\A[a-z0-9]+\z/i guard │
+     │ means a                                                                 │
+     │ pat_-prefixed string can never resolve as a legacy token even if        │
+     │ dispatch were buggy.                                                    │
+     │                                                                         │
+     │ Transport — header and HTTP Basic only, never a query parameter         │
+     │                                                                         │
+     │ PATs are accepted in X-Redmine-API-Key and as the HTTP Basic username.  │
+     │ They are                                                                │
+     │ not accepted in ?key=, because a URL-borne credential survives in       │
+     │ reverse-proxy                                                           │
+     │ access logs, Referer headers, browser history and pasted links — none   │
+     │ of which                                                                │
+     │ config.filter_parameters can reach. Legacy keys keep ?key= unchanged.   │
+     │                                                                         │
+     │ This needs no rejection code: a PAT sent as ?key= falls to              │
+     │ User.find_by_api_key,                                                   │
+     │ which returns nil via the token.rb:116 guard. The dispatch simply does  │
+     │ not attempt a                                                           │
+     │ PAT lookup when the value came from the parameter.                      │
+     │                                                                         │
+     │ Storage                                                                 │
+     │                                                                         │
+     │ SHA-256 hex (64 chars) in token_hash, unique-indexed. Plaintext exists  │
+     │ only in memory                                                          │
+     │ and is returned once by the create action. Not bcrypt: the secret is    │
+     │ already 160 random                                                      │
+     │ bits, so a slow KDF buys nothing and would forbid an indexed lookup.    │
+     │                                                                         │
+     │ Schema — db/migrate/<ts>_create_personal_access_tokens.rb ([7.2])       │
+     │                                                                         │
+     │ create_table :personal_access_tokens do |t|                             │
+     │   t.integer  :user_id,    null: false                                   │
+     │   t.string   :name,       limit: 60, null: false                        │
+     │   t.string   :token_hash, limit: 64, null: false                        │
+     │   t.date     :expires_on, null: false                                   │
+     │   t.datetime :created_on, precision: nil, null: false                   │
+     │ end                                                                     │
+     │ add_index :personal_access_tokens, :token_hash, unique: true            │
+     │ add_index :personal_access_tokens, :user_id                             │
+     │                                                                         │
+     │ expires_on is a date, matching the "midnight at the start of the next   │
+     │ day"                                                                    │
+     │ boundary and Redmine's own t.date columns (due_date, effective_date,    │
+     │ spent_on).                                                              │
+     │ A date column removes all timezone-serialization subtlety from the      │
+     │ comparison.                                                             │
+     │                                                                         │
+     │ Both indexes are plain single-column B-trees — portable across the CI   │
+     │ matrix.                                                                 │
+     │ No updated_on (nothing mutates a PAT), no last_used_on (deferred), no   │
+     │ revoked_at                                                              │
+     │ (revocation is physical DELETE, matching token.rb:144, user.rb:966,     │
+     │ user.rb:993,                                                            │
+     │ my_controller.rb:145 — Redmine has no soft-delete pattern for           │
+     │ credentials).                                                           │
+     │                                                                         │
+     │ Model — app/models/personal_access_token.rb                             │
+     │                                                                         │
+     │ Mirrors Token's find_token / find_user / find_active_user trio          │
+     │ (token.rb:96-126):                                                      │
+     │                                                                         │
+     │ PREFIX        = 'pat_'                                                  │
+     │ TOKEN_PATTERN = /\Apat_[0-9a-f]{40}\z/                                  │
+     │                                                                         │
+     │ belongs_to :user                                                        │
+     │ validates :name,       :presence => true, :length => {:maximum => 60}   │
+     │ validates :expires_on, :presence => true          # -> "Expiration date │
+     │ is required"                                                            │
+     │ validate  :expires_on_cannot_be_in_the_past                             │
+     │                                                                         │
+     │ def self.pat_format?(key)      # cheap gate, no DB hit                  │
+     │ def self.hash_token(plain)     # Digest::SHA256.hexdigest               │
+     │ def self.find_token(plain)     # format -> hash lookup ->               │
+     │ secure_compare -> expired?                                              │
+     │ def self.find_user(plain)                                               │
+     │ def self.find_active_user(plain)   # + user.active?                     │
+     │ def expired?                   # expires_on < Date.today                │
+     │ def generate_token!            # sets @plain_token + token_hash         │
+     │ attr_reader :plain_token       # ivar only — no column, cannot be       │
+     │ persisted                                                               │
+     │                                                                         │
+     │ Expiry boundary. The token is valid through the whole of expires_on and │
+     │ dies at                                                                 │
+     │ midnight starting the next day, i.e. expired? is expires_on <           │
+     │ Date.today. Date.today                                                  │
+     │ (system-local) is used rather than User.current.today because           │
+     │ User.current is not yet                                                 │
+     │ resolved during authentication; it is exactly the fallback branch of    │
+     │ User#today                                                              │
+     │ (user.rb:584-588) and keeps the decision independent of any display     │
+     │ preference.                                                             │
+     │                                                                         │
+     │ No default expiry and no maximum lifetime. The user must supply a date; │
+     │ a blank field                                                           │
+     │ fails validation with "Expiration date is required". A past date is     │
+     │ rejected; today is                                                      │
+     │ accepted (a one-day token).                                             │
+     │                                                                         │
+     │ User: has_many :personal_access_tokens, :dependent => :delete_all. That │
+     │ is the only                                                             │
+     │ change to User — no revocation-on-password-change callback.             │
+     │                                                                         │
+     │ Auth integration — application_controller.rb:131-133 and :152 only      │
+     │                                                                         │
+     │ if (key = api_key_from_request)                                         │
+     │   if PersonalAccessToken.pat_format?(key)                               │
+     │     # Personal access tokens are never accepted as a query parameter    │
+     │     user = PersonalAccessToken.find_active_user(key) if                 │
+     │ params[:key].blank?                                                     │
+     │   else                                                                  │
+     │     user = User.find_by_api_key(key)          # UNCHANGED               │
+     │   end                                                                   │
+     │ elsif access_token = Doorkeeper.authenticate(request)   # UNCHANGED     │
+     │ ...                                                                     │
+     │                                                                         │
+     │ and inside the Basic branch, :152 only:                                 │
+     │                                                                         │
+     │ user ||= if PersonalAccessToken.pat_format?(username)                   │
+     │            PersonalAccessToken.find_active_user(username)               │
+     │          else                                                           │
+     │            User.find_by_api_key(username)     # UNCHANGED               │
+     │          end                                                            │
+     │                                                                         │
+     │ No must_change_password? check is added. PATs authenticated via HTTP    │
+     │ Basic are covered                                                       │
+     │ by the pre-existing check at :154-157 (which sits outside the           │
+     │ authenticate_with_http_basic block and applies to whatever user         │
+     │ resolved to); PATs                                                      │
+     │ via the header are not. This asymmetry is inherited from Redmine 6.1.2, │
+     │ not introduced                                                          │
+     │ here — legacy keys behave identically today. No new authentication      │
+     │ policy is added.                                                        │
+     │                                                                         │
+     │ Precedence, the rest_api_enabled? / accept_api_auth? gate, Doorkeeper,  │
+     │ atom-key auth                                                           │
+     │ and X-Redmine-Switch-User are all untouched.                            │
+     │                                                                         │
+     │ Management — MyController, session + sudo only                          │
+     │                                                                         │
+     │ Add the three actions to require_sudo_mode (my_controller.rb:29). Do    │
+     │ not add them                                                            │
+     │ to accept_api_auth (:26). Consequence, with no extra code:              │
+     │ find_current_user:130                                                   │
+     │ requires accept_api_auth?, so a PAT-authenticated request never         │
+     │ authenticates against                                                   │
+     │ these actions → before_action :require_login (my_controller.rb:22) →    │
+     │ 403 via                                                                 │
+     │ application_controller.rb:293-297. A PAT cannot mint or revoke a PAT.   │
+     │                                                                         │
+     │ Revocation scopes the lookup to the owner:                              │
+     │ @pat = User.current.personal_access_tokens.find(params[:id])   # 404    │
+     │ for other users                                                         │
+     │                                                                         │
+     │ Create renders in place, never redirects, so the plaintext reaches the  │
+     │ response body                                                           │
+     │ without touching flash, session or a URL. This diverges deliberately    │
+     │ from reset_api_key                                                      │
+     │ (my_controller.rb:139-150), which can redirect only because it re-reads │
+     │ plaintext from                                                          │
+     │ the DB — an option hashing removes.                                     │
+     │                                                                         │
+     │ Routes — config/routes.rb, beside the my/ block at :97-99               │
+     │                                                                         │
+     │ get    'my/personal_access_tokens', :to => 'my#personal_access_tokens', │
+     │ :as => 'my_personal_access_tokens'                                      │
+     │ post   'my/personal_access_tokens', :to =>                              │
+     │ 'my#create_personal_access_token'                                       │
+     │ delete 'my/personal_access_tokens/:id', :to =>                          │
+     │ 'my#revoke_personal_access_token', :as => 'my_personal_access_token'    │
+     │                                                                         │
+     │ Views and locales                                                       │
+     │                                                                         │
+     │ New app/views/my/personal_access_tokens.html.erb (list + create form +  │
+     │ one-time reveal),                                                       │
+     │ reusing the existing Stimulus copy controller. Sidebar link in          │
+     │ _sidebar.html.erb, inside                                               │
+     │ the existing if Setting.rest_api_enabled? block (:21).                  │
+     │                                                                         │
+     │ config/locales/en.yml only — no rake locales:update, to keep the        │
+     │ reviewer's diff                                                         │
+     │ short. Backfilling the other 49 locales is a separate mechanical step.  │
+     │                                                                         │
+     │ Files                                                                   │
+     │                                                                         │
+     │ ┌──────────────────────────────────────────────────┬─────────────────── │
+     │ ────┐                                                                   │
+     │ │                       File                       │        Change      │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │                                                  │ new — this         │
+     │ document,  │                                                            │
+     │ │ doc/issue-43881/plan.md                          │ committed first    │
+     │ per   │                                                                 │
+     │ │                                                  │ CLAUDE.md workflow │
+     │    │                                                                    │
+     │ │                                                  │ step 4             │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ db/migrate/<ts>_create_personal_access_tokens.rb │ new                │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ app/models/personal_access_token.rb              │ new                │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │                                                  │ has_many …         │
+     │ dependent: │                                                            │
+     │ │ app/models/user.rb                               │  :delete_all (one  │
+     │    │                                                                    │
+     │ │                                                  │ line)              │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ app/controllers/application_controller.rb        │ dispatch at        │
+     │ :131-133  │                                                             │
+     │ │                                                  │ and :152 only      │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │                                                  │ 3 actions +        │
+     │    │                                                                    │
+     │ │ app/controllers/my_controller.rb                 │ require_sudo_mode; │
+     │ no │                                                                    │
+     │ │                                                  │  accept_api_auth   │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ config/routes.rb                                 │ 3 routes           │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ app/views/my/personal_access_tokens.html.erb     │ new                │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ app/views/my/_sidebar.html.erb                   │ link               │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ config/locales/en.yml                            │ new keys           │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ test/unit/personal_access_token_test.rb          │ new                │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ test/integration/api_test/authentication_test.rb │ PAT cases appended │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ test/functional/my_controller_test.rb            │ management cases   │
+     │    │                                                                    │
+     │ │                                                  │ appended           │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ test/fixtures/personal_access_tokens.yml         │ new                │
+     │    │                                                                    │
+     │ └──────────────────────────────────────────────────┴─────────────────── │
+     │ ────┘                                                                   │
+     │                                                                         │
+     │ Verification                                                            │
+     │                                                                         │
+     │ Focused, during implementation:                                         │
+     │ - bin/rails test test/unit/personal_access_token_test.rb                │
+     │ - bin/rails test test/integration/api_test/authentication_test.rb (must │
+     │ stay green — proves legacy untouched)                                   │
+     │ - bin/rails test test/unit/token_test.rb test/unit/user_test.rb         │
+     │ - bin/rails test test/functional/my_controller_test.rb                  │
+     │ - bin/rails test test/integration/api_test/disabled_rest_api_test.rb    │
+     │                                                                         │
+     │ Required test cases:                                                    │
+     │ 1. Happy path — X-Redmine-API-Key header → 200; HTTP Basic username →   │
+     │ 200                                                                     │
+     │ 2. PAT via ?key= → 401 (query-parameter auth forbidden)                 │
+     │ 3. Unknown token → 401                                                  │
+     │ 4. Expiry boundary: expires_on = Date.today → valid; expires_on =       │
+     │ Date.today - 1 → 401                                                    │
+     │ 5. Revoked (row deleted) → 401                                          │
+     │ 6. Locked user (STATUS_LOCKED) → 401; registered user → 401             │
+     │ 7. PAT rejected when Setting.rest_api_enabled = '0'                     │
+     │ 8. PAT rejected on an action without accept_api_auth                    │
+     │ 9. Legacy 40-hex key still works via ?key=, header and Basic            │
+     │ (regression)                                                            │
+     │ 10. POST /my/personal_access_tokens.json with a PAT → 403 (no privilege │
+     │ escalation)                                                             │
+     │ 11. User A cannot revoke User B's PAT → 404, and B's token still        │
+     │ authenticates                                                           │
+     │ 12. Plaintext appears in the create response exactly once; a follow-up  │
+     │ GET does not contain it                                                 │
+     │ 13. token_hash in DB ≠ plaintext; no column holds plaintext             │
+     │ 14. Blank expiry → validation error "Expiration date is required"; past │
+     │ date rejected                                                           │
+     │ 15. user.destroy destroys the user's PATs                               │
+     │ 16. A PAT value passed to User.find_by_api_key returns nil (namespace   │
+     │ disjointness)                                                           │
+     │                                                                         │
+     │ Mandatory gates before completion:                                      │
+     │ 1. bundle exec rubocop                                                  │
+     │ 2. bundle exec rake test                                                │
+     │ 3. bundle exec rails db:migrate from the stock 6.1.2 schema, then       │
+     │ db:rollback                                                             │
+     │ 4. App boots after migration                                            │
+     │ 5. Manual curl happy path via header and Basic; manual check that       │
+     │ ?key=<pat> is rejected                                                  │
+     │                                                                         │
+     │ Deferred (explicit)                                                     │
+     │                                                                         │
+     │ Rate limiting · scopes and granular endpoint control (seam noted:       │
+     │ role.rb:204-210                                                         │
+     │ allowed_to?(action, scope), user.rb:770,789, user.rb:736-744) · audit   │
+     │ logging ·                                                               │
+     │ CORS · last_used_on · maximum-lifetime cap · admin management of other  │
+     │ users' PATs ·                                                           │
+     │ legacy→PAT migration · a Setting to disable legacy keys · adding 'api'  │
+     │ to user.rb:962                                                          │
+     │ destroy_tokens · adding :key to config.filter_parameters (now purely    │
+     │ legacy                                                                  │
+     │ hardening, since PATs never appear in a URL) · bulk cleanup of expired  │
+     │ rows (cf.                                                               │
+     │ Token.destroy_expired, called only from lib/tasks/redmine.rake:39) ·    │
+     │ REST endpoints                                                          │
+     │ for PAT management · rake locales:update backfill · changes to          │
+     │ X-Redmine-Switch-User.                                                  │
+     ╰─────────────────────────────────────────────────────────────────────────╯
+
+✻ Worked for 8m 40s
+
+❯ belongs_to :user, :optional => false; Add test PAT without a valid user       
+  cannot be created                                                             
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ Applied. Worth noting why this correction matters more than it looks: it's the
+  payoff for the belongs_to check you asked me to run. Because Redmine sets no
+  config.load_defaults, belongs_to_required_by_default is falsy, so a bare
+  belongs_to :user would have silently accepted an ownerless PAT — and
+  db/schema.rb's null: false wouldn't catch it either, since Token defaults
+  user_id to 0 in the analogous table. Token depends on that laxity on purpose
+  (token.rb:21, test/unit/token_test.rb:27-32 saves a userless token); PATs must
+  diverge.
+
+  Test 17 covers both halves, since :optional => false validates that the
+  association resolves — a dangling user_id pointing at no row fails, not just a
+  nil one. That's the stronger guarantee and the reason the test has two cases.
+
+  Plan now has 17 required test cases.
+  ⎿  User rejected Claude's plan:
+     ╭─────────────────────────────────────────────────────────────────────────╮
+     │ Personal Access Tokens for the Redmine REST API (#43881)                │
+     │                                                                         │
+     │ Context                                                                 │
+     │                                                                         │
+     │ Redmine 6.1.2's REST API credential is a single, per-user, plaintext,   │
+     │ never-expiring                                                          │
+     │ string in tokens.value (db/schema.rb:549-557, token.rb:39). It cannot   │
+     │ be named,                                                               │
+     │ cannot expire, and cannot be individually revoked.                      │
+     │                                                                         │
+     │ This plan adds Personal Access Tokens as a parallel, additive           │
+     │ mechanism: multiple                                                     │
+     │ named tokens per user, hashed at rest, mandatory expiry, individually   │
+     │ revocable,                                                              │
+     │ self-service in My Account. The legacy API key path is left             │
+     │ byte-for-byte unchanged.                                                │
+     │                                                                         │
+     │ Rate limiting, scopes, audit logging and CORS are out of scope.         │
+     │                                                                         │
+     │ Verified facts (repository evidence)                                    │
+     │                                                                         │
+     │ Fact: Single auth seam                                                  │
+     │ Evidence: application_controller.rb:112-173 find_current_user           │
+     │ ────────────────────────────────────────                                │
+     │ Fact: API block gate                                                    │
+     │ Evidence: application_controller.rb:130 — Setting.rest_api_enabled? &&  │
+     │ accept_api_auth?, not api_request?                                      │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Key entry points                                                  │
+     │ Evidence: application_controller.rb:727-734 api_key_from_request (param │
+     │ →                                                                       │
+     │ header), :152 (Basic username)                                          │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Legacy keys plaintext, never expire                               │
+     │ Evidence: db/schema.rb:549-557; token.rb:39                             │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Legacy lookup rejects _                                           │
+     │ Evidence: token.rb:116 /\A[a-z0-9]+\z/i — makes pat_… structurally      │
+     │ un-resolvable as a legacy token                                         │
+     │ ────────────────────────────────────────                                │
+     │ Fact: belongs_to is optional                                            │
+     │ Evidence: No config.load_defaults / belongs_to_required_by_default in   │
+     │ config/application.rb; activerecord-7.2.3/lib/active_record/core.rb:89  │
+     │ declares it with no default (→ falsy). Confirmed by                     │
+     │ test/unit/token_test.rb:27-32.                                          │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Date columns exist in core                                        │
+     │ Evidence: db/schema.rb:273 due_date, :283 start_date, :535 spent_on,    │
+     │ :606                                                                    │
+     │ effective_date — all t.date                                             │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Date-boundary idiom                                               │
+     │ Evidence: issue.rb:994, version.rb:268 — x < User.current.today;        │
+     │ user.rb:583-589 User#today falls back to Date.today when time_zone is   │
+     │ nil                                                                     │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Migration convention                                              │
+     │ Evidence: ActiveRecord::Migration[7.2]; db/schema.rb; no FK constraints │
+     │                                                                         │
+     │ anywhere                                                                │
+     │ ────────────────────────────────────────                                │
+     │ Fact: CI DB matrix                                                      │
+     │ Evidence: .github/workflows/tests.yml:11-15 — sqlite3 / postgresql /    │
+     │ mysql2 →                                                                │
+     │ plain portable indexes only                                             │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Management is session-only today                                  │
+     │ Evidence: my_controller.rb:26-29 — show_api_key/reset_api_key not in    │
+     │ accept_api_auth, and require_sudo_mode                                  │
+     │ ────────────────────────────────────────                                │
+     │ Fact: sudo_mode default                                                 │
+     │ Evidence: config/configuration.yml.example:167 "Disabled by default";   │
+     │ sudo_mode.rb:233                                                        │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Reusable copy UI                                                  │
+     │ Evidence: app/javascript/controllers/api_key_copy_controller.js         │
+     │ ────────────────────────────────────────                                │
+     │ Fact: Reusable RNG                                                      │
+     │ Evidence: Redmine::Utils.random_hex (lib/redmine/utils.rb), used by     │
+     │ token.rb:129                                                            │
+     │                                                                         │
+     │ Baseline suite green and db/redmine.sqlite3 at stock 6.1.2 schema —     │
+     │ confirmed by the user.                                                  │
+     │                                                                         │
+     │ Open assumption: the mandatory-expiry requirement rests on the user's   │
+     │ statement of                                                            │
+     │ ticket #43881. There is no local copy of the ticket in the repository.  │
+     │                                                                         │
+     │ Design                                                                  │
+     │                                                                         │
+     │ Token format                                                            │
+     │                                                                         │
+     │ pat_ + 40 lowercase hex (Redmine::Utils.random_hex(20), 160 bits) = 44  │
+     │ chars.                                                                  │
+     │ Namespaces are provably disjoint: token.rb:116's /\A[a-z0-9]+\z/i guard │
+     │ means a                                                                 │
+     │ pat_-prefixed string can never resolve as a legacy token even if        │
+     │ dispatch were buggy.                                                    │
+     │                                                                         │
+     │ Transport — header and HTTP Basic only, never a query parameter         │
+     │                                                                         │
+     │ PATs are accepted in X-Redmine-API-Key and as the HTTP Basic username.  │
+     │ They are                                                                │
+     │ not accepted in ?key=, because a URL-borne credential survives in       │
+     │ reverse-proxy                                                           │
+     │ access logs, Referer headers, browser history and pasted links — none   │
+     │ of which                                                                │
+     │ config.filter_parameters can reach. Legacy keys keep ?key= unchanged.   │
+     │                                                                         │
+     │ This needs no rejection code: a PAT sent as ?key= falls to              │
+     │ User.find_by_api_key,                                                   │
+     │ which returns nil via the token.rb:116 guard. The dispatch simply does  │
+     │ not attempt a                                                           │
+     │ PAT lookup when the value came from the parameter.                      │
+     │                                                                         │
+     │ Storage                                                                 │
+     │                                                                         │
+     │ SHA-256 hex (64 chars) in token_hash, unique-indexed. Plaintext exists  │
+     │ only in memory                                                          │
+     │ and is returned once by the create action. Not bcrypt: the secret is    │
+     │ already 160 random                                                      │
+     │ bits, so a slow KDF buys nothing and would forbid an indexed lookup.    │
+     │                                                                         │
+     │ Schema — db/migrate/<ts>_create_personal_access_tokens.rb ([7.2])       │
+     │                                                                         │
+     │ create_table :personal_access_tokens do |t|                             │
+     │   t.integer  :user_id,    null: false                                   │
+     │   t.string   :name,       limit: 60, null: false                        │
+     │   t.string   :token_hash, limit: 64, null: false                        │
+     │   t.date     :expires_on, null: false                                   │
+     │   t.datetime :created_on, precision: nil, null: false                   │
+     │ end                                                                     │
+     │ add_index :personal_access_tokens, :token_hash, unique: true            │
+     │ add_index :personal_access_tokens, :user_id                             │
+     │                                                                         │
+     │ expires_on is a date, matching the "midnight at the start of the next   │
+     │ day"                                                                    │
+     │ boundary and Redmine's own t.date columns (due_date, effective_date,    │
+     │ spent_on).                                                              │
+     │ A date column removes all timezone-serialization subtlety from the      │
+     │ comparison.                                                             │
+     │                                                                         │
+     │ Both indexes are plain single-column B-trees — portable across the CI   │
+     │ matrix.                                                                 │
+     │ No updated_on (nothing mutates a PAT), no last_used_on (deferred), no   │
+     │ revoked_at                                                              │
+     │ (revocation is physical DELETE, matching token.rb:144, user.rb:966,     │
+     │ user.rb:993,                                                            │
+     │ my_controller.rb:145 — Redmine has no soft-delete pattern for           │
+     │ credentials).                                                           │
+     │                                                                         │
+     │ Model — app/models/personal_access_token.rb                             │
+     │                                                                         │
+     │ Mirrors Token's find_token / find_user / find_active_user trio          │
+     │ (token.rb:96-126):                                                      │
+     │                                                                         │
+     │ PREFIX        = 'pat_'                                                  │
+     │ TOKEN_PATTERN = /\Apat_[0-9a-f]{40}\z/                                  │
+     │                                                                         │
+     │ belongs_to :user, :optional => false                                    │
+     │ validates :name,       :presence => true, :length => {:maximum => 60}   │
+     │ validates :expires_on, :presence => true          # -> "Expiration date │
+     │ is required"                                                            │
+     │ validate  :expires_on_cannot_be_in_the_past                             │
+     │                                                                         │
+     │ def self.pat_format?(key)      # cheap gate, no DB hit                  │
+     │ def self.hash_token(plain)     # Digest::SHA256.hexdigest               │
+     │ def self.find_token(plain)     # format -> hash lookup ->               │
+     │ secure_compare -> expired?                                              │
+     │ def self.find_user(plain)                                               │
+     │ def self.find_active_user(plain)   # + user.active?                     │
+     │ def expired?                   # expires_on < Date.today                │
+     │ def generate_token!            # sets @plain_token + token_hash         │
+     │ attr_reader :plain_token       # ivar only — no column, cannot be       │
+     │ persisted                                                               │
+     │                                                                         │
+     │ Expiry boundary. The token is valid through the whole of expires_on and │
+     │ dies at                                                                 │
+     │ midnight starting the next day, i.e. expired? is expires_on <           │
+     │ Date.today. Date.today                                                  │
+     │ (system-local) is used rather than User.current.today because           │
+     │ User.current is not yet                                                 │
+     │ resolved during authentication; it is exactly the fallback branch of    │
+     │ User#today                                                              │
+     │ (user.rb:584-588) and keeps the decision independent of any display     │
+     │ preference.                                                             │
+     │                                                                         │
+     │ No default expiry and no maximum lifetime. The user must supply a date; │
+     │ a blank field                                                           │
+     │ fails validation with "Expiration date is required". A past date is     │
+     │ rejected; today is                                                      │
+     │ accepted (a one-day token).                                             │
+     │                                                                         │
+     │ :optional => false is explicit and load-bearing, not decorative:        │
+     │ Redmine sets no                                                         │
+     │ config.load_defaults, so belongs_to_required_by_default is falsy (see   │
+     │ Verified facts)                                                         │
+     │ and a bare belongs_to would accept an ownerless token. Token relies on  │
+     │ that laxity                                                             │
+     │ deliberately (token.rb:21, test/unit/token_test.rb:27-32 saves a        │
+     │ userless token); a                                                      │
+     │ PAT must not. It also validates that the association resolves, so a     │
+     │ dangling                                                                │
+     │ user_id pointing at no row is rejected, not merely a nil one.           │
+     │                                                                         │
+     │ User: has_many :personal_access_tokens, :dependent => :delete_all. That │
+     │ is the only                                                             │
+     │ change to User — no revocation-on-password-change callback.             │
+     │                                                                         │
+     │ Auth integration — application_controller.rb:131-133 and :152 only      │
+     │                                                                         │
+     │ if (key = api_key_from_request)                                         │
+     │   if PersonalAccessToken.pat_format?(key)                               │
+     │     # Personal access tokens are never accepted as a query parameter    │
+     │     user = PersonalAccessToken.find_active_user(key) if                 │
+     │ params[:key].blank?                                                     │
+     │   else                                                                  │
+     │     user = User.find_by_api_key(key)          # UNCHANGED               │
+     │   end                                                                   │
+     │ elsif access_token = Doorkeeper.authenticate(request)   # UNCHANGED     │
+     │ ...                                                                     │
+     │                                                                         │
+     │ and inside the Basic branch, :152 only:                                 │
+     │                                                                         │
+     │ user ||= if PersonalAccessToken.pat_format?(username)                   │
+     │            PersonalAccessToken.find_active_user(username)               │
+     │          else                                                           │
+     │            User.find_by_api_key(username)     # UNCHANGED               │
+     │          end                                                            │
+     │                                                                         │
+     │ No must_change_password? check is added. PATs authenticated via HTTP    │
+     │ Basic are covered                                                       │
+     │ by the pre-existing check at :154-157 (which sits outside the           │
+     │ authenticate_with_http_basic block and applies to whatever user         │
+     │ resolved to); PATs                                                      │
+     │ via the header are not. This asymmetry is inherited from Redmine 6.1.2, │
+     │ not introduced                                                          │
+     │ here — legacy keys behave identically today. No new authentication      │
+     │ policy is added.                                                        │
+     │                                                                         │
+     │ Precedence, the rest_api_enabled? / accept_api_auth? gate, Doorkeeper,  │
+     │ atom-key auth                                                           │
+     │ and X-Redmine-Switch-User are all untouched.                            │
+     │                                                                         │
+     │ Management — MyController, session + sudo only                          │
+     │                                                                         │
+     │ Add the three actions to require_sudo_mode (my_controller.rb:29). Do    │
+     │ not add them                                                            │
+     │ to accept_api_auth (:26). Consequence, with no extra code:              │
+     │ find_current_user:130                                                   │
+     │ requires accept_api_auth?, so a PAT-authenticated request never         │
+     │ authenticates against                                                   │
+     │ these actions → before_action :require_login (my_controller.rb:22) →    │
+     │ 403 via                                                                 │
+     │ application_controller.rb:293-297. A PAT cannot mint or revoke a PAT.   │
+     │                                                                         │
+     │ Revocation scopes the lookup to the owner:                              │
+     │ @pat = User.current.personal_access_tokens.find(params[:id])   # 404    │
+     │ for other users                                                         │
+     │                                                                         │
+     │ Create renders in place, never redirects, so the plaintext reaches the  │
+     │ response body                                                           │
+     │ without touching flash, session or a URL. This diverges deliberately    │
+     │ from reset_api_key                                                      │
+     │ (my_controller.rb:139-150), which can redirect only because it re-reads │
+     │ plaintext from                                                          │
+     │ the DB — an option hashing removes.                                     │
+     │                                                                         │
+     │ Routes — config/routes.rb, beside the my/ block at :97-99               │
+     │                                                                         │
+     │ get    'my/personal_access_tokens', :to => 'my#personal_access_tokens', │
+     │ :as => 'my_personal_access_tokens'                                      │
+     │ post   'my/personal_access_tokens', :to =>                              │
+     │ 'my#create_personal_access_token'                                       │
+     │ delete 'my/personal_access_tokens/:id', :to =>                          │
+     │ 'my#revoke_personal_access_token', :as => 'my_personal_access_token'    │
+     │                                                                         │
+     │ Views and locales                                                       │
+     │                                                                         │
+     │ New app/views/my/personal_access_tokens.html.erb (list + create form +  │
+     │ one-time reveal),                                                       │
+     │ reusing the existing Stimulus copy controller. Sidebar link in          │
+     │ _sidebar.html.erb, inside                                               │
+     │ the existing if Setting.rest_api_enabled? block (:21).                  │
+     │                                                                         │
+     │ config/locales/en.yml only — no rake locales:update, to keep the        │
+     │ reviewer's diff                                                         │
+     │ short. Backfilling the other 49 locales is a separate mechanical step.  │
+     │                                                                         │
+     │ Files                                                                   │
+     │                                                                         │
+     │ ┌──────────────────────────────────────────────────┬─────────────────── │
+     │ ────┐                                                                   │
+     │ │                       File                       │        Change      │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │                                                  │ new — this         │
+     │ document,  │                                                            │
+     │ │ doc/issue-43881/plan.md                          │ committed first    │
+     │ per   │                                                                 │
+     │ │                                                  │ CLAUDE.md workflow │
+     │    │                                                                    │
+     │ │                                                  │ step 4             │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ db/migrate/<ts>_create_personal_access_tokens.rb │ new                │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ app/models/personal_access_token.rb              │ new                │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │                                                  │ has_many …         │
+     │ dependent: │                                                            │
+     │ │ app/models/user.rb                               │  :delete_all (one  │
+     │    │                                                                    │
+     │ │                                                  │ line)              │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ app/controllers/application_controller.rb        │ dispatch at        │
+     │ :131-133  │                                                             │
+     │ │                                                  │ and :152 only      │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │                                                  │ 3 actions +        │
+     │    │                                                                    │
+     │ │ app/controllers/my_controller.rb                 │ require_sudo_mode; │
+     │ no │                                                                    │
+     │ │                                                  │  accept_api_auth   │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ config/routes.rb                                 │ 3 routes           │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ app/views/my/personal_access_tokens.html.erb     │ new                │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ app/views/my/_sidebar.html.erb                   │ link               │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ config/locales/en.yml                            │ new keys           │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ test/unit/personal_access_token_test.rb          │ new                │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ test/integration/api_test/authentication_test.rb │ PAT cases appended │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ test/functional/my_controller_test.rb            │ management cases   │
+     │    │                                                                    │
+     │ │                                                  │ appended           │
+     │    │                                                                    │
+     │ ├──────────────────────────────────────────────────┼─────────────────── │
+     │ ────┤                                                                   │
+     │ │ test/fixtures/personal_access_tokens.yml         │ new                │
+     │    │                                                                    │
+     │ └──────────────────────────────────────────────────┴─────────────────── │
+     │ ────┘                                                                   │
+     │                                                                         │
+     │ Verification                                                            │
+     │                                                                         │
+     │ Focused, during implementation:                                         │
+     │ - bin/rails test test/unit/personal_access_token_test.rb                │
+     │ - bin/rails test test/integration/api_test/authentication_test.rb (must │
+     │ stay green — proves legacy untouched)                                   │
+     │ - bin/rails test test/unit/token_test.rb test/unit/user_test.rb         │
+     │ - bin/rails test test/functional/my_controller_test.rb                  │
+     │ - bin/rails test test/integration/api_test/disabled_rest_api_test.rb    │
+     │                                                                         │
+     │ Required test cases:                                                    │
+     │ 1. Happy path — X-Redmine-API-Key header → 200; HTTP Basic username →   │
+     │ 200                                                                     │
+     │ 2. PAT via ?key= → 401 (query-parameter auth forbidden)                 │
+     │ 3. Unknown token → 401                                                  │
+     │ 4. Expiry boundary: expires_on = Date.today → valid; expires_on =       │
+     │ Date.today - 1 → 401                                                    │
+     │ 5. Revoked (row deleted) → 401                                          │
+     │ 6. Locked user (STATUS_LOCKED) → 401; registered user → 401             │
+     │ 7. PAT rejected when Setting.rest_api_enabled = '0'                     │
+     │ 8. PAT rejected on an action without accept_api_auth                    │
+     │ 9. Legacy 40-hex key still works via ?key=, header and Basic            │
+     │ (regression)                                                            │
+     │ 10. POST /my/personal_access_tokens.json with a PAT → 403 (no privilege │
+     │ escalation)                                                             │
+     │ 11. User A cannot revoke User B's PAT → 404, and B's token still        │
+     │ authenticates                                                           │
+     │ 12. Plaintext appears in the create response exactly once; a follow-up  │
+     │ GET does not contain it                                                 │
+     │ 13. token_hash in DB ≠ plaintext; no column holds plaintext             │
+     │ 14. Blank expiry → validation error "Expiration date is required"; past │
+     │ date rejected                                                           │
+     │ 15. user.destroy destroys the user's PATs                               │
+     │ 16. A PAT value passed to User.find_by_api_key returns nil (namespace   │
+     │ disjointness)                                                           │
+     │ 17. A PAT without a valid user cannot be created — user nil → invalid,  │
+     │ and                                                                     │
+     │ user_id pointing at a nonexistent row → invalid (proves :optional =>    │
+     │ false                                                                   │
+     │ validates association resolution, not just presence of the id)          │
+     │                                                                         │
+     │ Mandatory gates before completion:                                      │
+     │ 1. bundle exec rubocop                                                  │
+     │ 2. bundle exec rake test                                                │
+     │ 3. bundle exec rails db:migrate from the stock 6.1.2 schema, then       │
+     │ db:rollback                                                             │
+     │ 4. App boots after migration                                            │
+     │ 5. Manual curl happy path via header and Basic; manual check that       │
+     │ ?key=<pat> is rejected                                                  │
+     │                                                                         │
+     │ Deferred (explicit)                                                     │
+     │                                                                         │
+     │ Rate limiting · scopes and granular endpoint control (seam noted:       │
+     │ role.rb:204-210                                                         │
+     │ allowed_to?(action, scope), user.rb:770,789, user.rb:736-744) · audit   │
+     │ logging ·                                                               │
+     │ CORS · last_used_on · maximum-lifetime cap · admin management of other  │
+     │ users' PATs ·                                                           │
+     │ legacy→PAT migration · a Setting to disable legacy keys · adding 'api'  │
+     │ to user.rb:962                                                          │
+     │ destroy_tokens · adding :key to config.filter_parameters (now purely    │
+     │ legacy                                                                  │
+     │ hardening, since PATs never appear in a URL) · bulk cleanup of expired  │
+     │ rows (cf.                                                               │
+     │ Token.destroy_expired, called only from lib/tasks/redmine.rake:39) ·    │
+     │ REST endpoints                                                          │
+     │ for PAT management · rake locales:update backfill · changes to          │
+     │ X-Redmine-Switch-User.                                                  │
+     ╰─────────────────────────────────────────────────────────────────────────╯
+
+✻ Worked for 1m 23s
+
+❯ The technical plan is approved in substance. Before implementation, the       
+  approved plan must be persisted as `doc/issue-43881/plan.md` in the           
+  repository as a durable workflow artifact. Update the execution plan so that  
+  the first step after approval is to create docs/takehome/plan.md from this    
+  approved plan, then STOP and wait for my explicit approval before making any  
+  application-code changes.                                                     
+
+⏺ The plan is approved in substance — but your message names two different
+  paths, and I won't guess silently.
+
+  - Twice you wrote doc/issue-43881/plan.md (and once in your previous message)
+  - Once you wrote docs/takehome/plan.md
+
+  CLAUDE.md workflow step 4 mandates doc/issue-43881/plan.md. I'm treating that
+  as authoritative and docs/takehome/plan.md as a slip. Say so if you actually
+  want the docs/takehome/ path, or both.
+
+  Adding the execution gate now:
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ The plan now carries an explicit two-gate structure:
+
+  - Step 1 — write doc/issue-43881/plan.md. That is the only file the current
+  approval authorises.
+  - Step 2 — hard stop, report, wait.
+  - Step 3+ — migration, model, controller, routes, views, locales, tests.
+  Blocked until you approve a second time.
+
+  The Files table is split along the same line so the boundary can't be misread
+  mid-execution.
+
+  Exiting plan mode now will let me write that one file and nothing else.
+
+⏺ User approved Claude's plan
+  ⎿  Plan saved to: ~/.claude/plans/we-are-implementing-the-harmonic-wombat.md ·
+     /plan to edit
+     Personal Access Tokens for the Redmine REST API (#43881)
+
+     Context
+
+     Redmine 6.1.2's REST API credential is a single, per-user, plaintext,
+     never-expiring
+     string in tokens.value (db/schema.rb:549-557, token.rb:39). It cannot be
+     named,
+     cannot expire, and cannot be individually revoked.
+
+     This plan adds Personal Access Tokens as a parallel, additive mechanism:
+     multiple
+     named tokens per user, hashed at rest, mandatory expiry, individually
+     revocable,
+     self-service in My Account. The legacy API key path is left byte-for-byte
+     unchanged.
+
+     Rate limiting, scopes, audit logging and CORS are out of scope.
+
+     Execution order — HARD STOP after step 1
+
+     Step 1 (this approval covers only this). Create doc/issue-43881/plan.md
+     from this
+     document, per CLAUDE.md workflow step 4, as a durable repository artifact
+     recording
+     approved scope, alternatives considered, decisions, rationale, trade-offs,
+     deferred work,
+     acceptance criteria and verification strategy. No other file is touched.
+
+     Step 2. STOP. Report that the artifact exists and wait for explicit human
+     approval.
+
+     Step 3 onward — blocked until that approval is given. Migration, model,
+     controller,
+     routes, views, locales and tests, in the order listed under Files. No
+     application code
+     is written before step 2 clears.
+
+     This gate is deliberate: CLAUDE.md states "Do not modify application code
+     before the
+     implementation plan is explicitly approved by the human," and approval of a
+     plan document
+     is not the same act as approval to begin implementing it.
+
+     Verified facts (repository evidence)
+
+     Fact: Single auth seam
+     Evidence: application_controller.rb:112-173 find_current_user
+     ────────────────────────────────────────
+     Fact: API block gate
+     Evidence: application_controller.rb:130 — Setting.rest_api_enabled? && 
+     accept_api_auth?, not api_request?
+     ────────────────────────────────────────
+     Fact: Key entry points
+     Evidence: application_controller.rb:727-734 api_key_from_request (param →
+     header), :152 (Basic username)
+     ────────────────────────────────────────
+     Fact: Legacy keys plaintext, never expire
+     Evidence: db/schema.rb:549-557; token.rb:39
+     ────────────────────────────────────────
+     Fact: Legacy lookup rejects _
+     Evidence: token.rb:116 /\A[a-z0-9]+\z/i — makes pat_… structurally
+     un-resolvable as a legacy token
+     ────────────────────────────────────────
+     Fact: belongs_to is optional
+     Evidence: No config.load_defaults / belongs_to_required_by_default in
+     config/application.rb; activerecord-7.2.3/lib/active_record/core.rb:89
+     declares it with no default (→ falsy). Confirmed by
+     test/unit/token_test.rb:27-32.
+     ────────────────────────────────────────
+     Fact: Date columns exist in core
+     Evidence: db/schema.rb:273 due_date, :283 start_date, :535 spent_on, :606
+     effective_date — all t.date
+     ────────────────────────────────────────
+     Fact: Date-boundary idiom
+     Evidence: issue.rb:994, version.rb:268 — x < User.current.today;
+     user.rb:583-589 User#today falls back to Date.today when time_zone is nil
+     ────────────────────────────────────────
+     Fact: Migration convention
+     Evidence: ActiveRecord::Migration[7.2]; db/schema.rb; no FK constraints
+     anywhere
+     ────────────────────────────────────────
+     Fact: CI DB matrix
+     Evidence: .github/workflows/tests.yml:11-15 — sqlite3 / postgresql / mysql2
+     →
+     plain portable indexes only
+     ────────────────────────────────────────
+     Fact: Management is session-only today
+     Evidence: my_controller.rb:26-29 — show_api_key/reset_api_key not in
+     accept_api_auth, and require_sudo_mode
+     ────────────────────────────────────────
+     Fact: sudo_mode default
+     Evidence: config/configuration.yml.example:167 "Disabled by default";
+     sudo_mode.rb:233
+     ────────────────────────────────────────
+     Fact: Reusable copy UI
+     Evidence: app/javascript/controllers/api_key_copy_controller.js
+     ────────────────────────────────────────
+     Fact: Reusable RNG
+     Evidence: Redmine::Utils.random_hex (lib/redmine/utils.rb), used by
+     token.rb:129
+
+     Baseline suite green and db/redmine.sqlite3 at stock 6.1.2 schema —
+     confirmed by the user.
+
+     Open assumption: the mandatory-expiry requirement rests on the user's
+     statement of
+     ticket #43881. There is no local copy of the ticket in the repository.
+
+     Design
+
+     Token format
+
+     pat_ + 40 lowercase hex (Redmine::Utils.random_hex(20), 160 bits) = 44
+     chars.
+     Namespaces are provably disjoint: token.rb:116's /\A[a-z0-9]+\z/i guard
+     means a
+     pat_-prefixed string can never resolve as a legacy token even if dispatch
+     were buggy.
+
+     Transport — header and HTTP Basic only, never a query parameter
+
+     PATs are accepted in X-Redmine-API-Key and as the HTTP Basic username. They
+     are
+     not accepted in ?key=, because a URL-borne credential survives in
+     reverse-proxy
+     access logs, Referer headers, browser history and pasted links — none of
+     which
+     config.filter_parameters can reach. Legacy keys keep ?key= unchanged.
+
+     This needs no rejection code: a PAT sent as ?key= falls to
+     User.find_by_api_key,
+     which returns nil via the token.rb:116 guard. The dispatch simply does not
+     attempt a
+     PAT lookup when the value came from the parameter.
+
+     Storage
+
+     SHA-256 hex (64 chars) in token_hash, unique-indexed. Plaintext exists only
+     in memory
+     and is returned once by the create action. Not bcrypt: the secret is
+     already 160 random
+     bits, so a slow KDF buys nothing and would forbid an indexed lookup.
+
+     Schema — db/migrate/<ts>_create_personal_access_tokens.rb ([7.2])
+
+     create_table :personal_access_tokens do |t|
+       t.integer  :user_id,    null: false
+       t.string   :name,       limit: 60, null: false
+       t.string   :token_hash, limit: 64, null: false
+       t.date     :expires_on, null: false
+       t.datetime :created_on, precision: nil, null: false
+     end
+     add_index :personal_access_tokens, :token_hash, unique: true
+     add_index :personal_access_tokens, :user_id
+
+     expires_on is a date, matching the "midnight at the start of the next day"
+     boundary and Redmine's own t.date columns (due_date, effective_date,
+     spent_on).
+     A date column removes all timezone-serialization subtlety from the
+     comparison.
+
+     Both indexes are plain single-column B-trees — portable across the CI
+     matrix.
+     No updated_on (nothing mutates a PAT), no last_used_on (deferred), no
+     revoked_at
+     (revocation is physical DELETE, matching token.rb:144, user.rb:966,
+     user.rb:993,
+     my_controller.rb:145 — Redmine has no soft-delete pattern for credentials).
+
+     Model — app/models/personal_access_token.rb
+
+     Mirrors Token's find_token / find_user / find_active_user trio
+     (token.rb:96-126):
+
+     PREFIX        = 'pat_'
+     TOKEN_PATTERN = /\Apat_[0-9a-f]{40}\z/
+
+     belongs_to :user, :optional => false
+     validates :name,       :presence => true, :length => {:maximum => 60}
+     validates :expires_on, :presence => true          # -> "Expiration date is 
+     required"
+     validate  :expires_on_cannot_be_in_the_past
+
+     def self.pat_format?(key)      # cheap gate, no DB hit
+     def self.hash_token(plain)     # Digest::SHA256.hexdigest
+     def self.find_token(plain)     # format -> hash lookup -> secure_compare ->
+     expired?
+     def self.find_user(plain)
+     def self.find_active_user(plain)   # + user.active?
+     def expired?                   # expires_on < Date.today
+     def generate_token!            # sets @plain_token + token_hash
+     attr_reader :plain_token       # ivar only — no column, cannot be persisted
+
+     Expiry boundary. The token is valid through the whole of expires_on and
+     dies at
+     midnight starting the next day, i.e. expired? is expires_on < Date.today.
+     Date.today
+     (system-local) is used rather than User.current.today because User.current
+     is not yet
+     resolved during authentication; it is exactly the fallback branch of
+     User#today
+     (user.rb:584-588) and keeps the decision independent of any display
+     preference.
+
+     No default expiry and no maximum lifetime. The user must supply a date; a
+     blank field
+     fails validation with "Expiration date is required". A past date is
+     rejected; today is
+     accepted (a one-day token).
+
+     :optional => false is explicit and load-bearing, not decorative: Redmine
+     sets no
+     config.load_defaults, so belongs_to_required_by_default is falsy (see
+     Verified facts)
+     and a bare belongs_to would accept an ownerless token. Token relies on that
+     laxity
+     deliberately (token.rb:21, test/unit/token_test.rb:27-32 saves a userless
+     token); a
+     PAT must not. It also validates that the association resolves, so a
+     dangling
+     user_id pointing at no row is rejected, not merely a nil one.
+
+     User: has_many :personal_access_tokens, :dependent => :delete_all. That is
+     the only
+     change to User — no revocation-on-password-change callback.
+
+     Auth integration — application_controller.rb:131-133 and :152 only
+
+     if (key = api_key_from_request)
+       if PersonalAccessToken.pat_format?(key)
+         # Personal access tokens are never accepted as a query parameter
+         user = PersonalAccessToken.find_active_user(key) if params[:key].blank?
+       else
+         user = User.find_by_api_key(key)          # UNCHANGED
+       end
+     elsif access_token = Doorkeeper.authenticate(request)   # UNCHANGED
+     ...
+
+     and inside the Basic branch, :152 only:
+
+     user ||= if PersonalAccessToken.pat_format?(username)
+                PersonalAccessToken.find_active_user(username)
+              else
+                User.find_by_api_key(username)     # UNCHANGED
+              end
+
+     No must_change_password? check is added. PATs authenticated via HTTP Basic
+     are covered
+     by the pre-existing check at :154-157 (which sits outside the
+     authenticate_with_http_basic block and applies to whatever user resolved
+     to); PATs
+     via the header are not. This asymmetry is inherited from Redmine 6.1.2, not
+     introduced
+     here — legacy keys behave identically today. No new authentication policy
+     is added.
+
+     Precedence, the rest_api_enabled? / accept_api_auth? gate, Doorkeeper,
+     atom-key auth
+     and X-Redmine-Switch-User are all untouched.
+
+     Management — MyController, session + sudo only
+
+     Add the three actions to require_sudo_mode (my_controller.rb:29). Do not
+     add them
+     to accept_api_auth (:26). Consequence, with no extra code:
+     find_current_user:130
+     requires accept_api_auth?, so a PAT-authenticated request never
+     authenticates against
+     these actions → before_action :require_login (my_controller.rb:22) → 403
+     via
+     application_controller.rb:293-297. A PAT cannot mint or revoke a PAT.
+
+     Revocation scopes the lookup to the owner:
+     @pat = User.current.personal_access_tokens.find(params[:id])   # 404 for 
+     other users
+
+     Create renders in place, never redirects, so the plaintext reaches the
+     response body
+     without touching flash, session or a URL. This diverges deliberately from
+     reset_api_key
+     (my_controller.rb:139-150), which can redirect only because it re-reads
+     plaintext from
+     the DB — an option hashing removes.
+
+     Routes — config/routes.rb, beside the my/ block at :97-99
+
+     get    'my/personal_access_tokens', :to => 'my#personal_access_tokens', :as
+     => 'my_personal_access_tokens'
+     post   'my/personal_access_tokens', :to =>
+     'my#create_personal_access_token'
+     delete 'my/personal_access_tokens/:id', :to =>
+     'my#revoke_personal_access_token', :as => 'my_personal_access_token'
+
+     Views and locales
+
+     New app/views/my/personal_access_tokens.html.erb (list + create form +
+     one-time reveal),
+     reusing the existing Stimulus copy controller. Sidebar link in
+     _sidebar.html.erb, inside
+     the existing if Setting.rest_api_enabled? block (:21).
+
+     config/locales/en.yml only — no rake locales:update, to keep the reviewer's
+     diff
+     short. Backfilling the other 49 locales is a separate mechanical step.
+
+     Files
+
+     Step 1 — the only file authorised by the current approval:
+
+     ┌─────────────────────────┬────────────────────────────────────────────────
+     ┐
+     │          File           │                     Change
+     │
+     ├─────────────────────────┼────────────────────────────────────────────────
+     ┤
+     │ doc/issue-43881/plan.md │ new — this document, per CLAUDE.md workflow
+     │
+     │                         │ step 4
+     │
+     └─────────────────────────┴────────────────────────────────────────────────
+     ┘
+
+     Step 3 onward — blocked pending a second, explicit approval:
+
+     ┌──────────────────────────────────────────────────┬───────────────────────
+     ┐
+     │                       File                       │        Change
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │ db/migrate/<ts>_create_personal_access_tokens.rb │ new
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │ app/models/personal_access_token.rb              │ new
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │                                                  │ has_many … dependent:
+     │
+     │ app/models/user.rb                               │  :delete_all (one
+     │
+     │                                                  │ line)
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │ app/controllers/application_controller.rb        │ dispatch at :131-133
+     │
+     │                                                  │ and :152 only
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │                                                  │ 3 actions +
+     │
+     │ app/controllers/my_controller.rb                 │ require_sudo_mode; no
+     │
+     │                                                  │  accept_api_auth
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │ config/routes.rb                                 │ 3 routes
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │ app/views/my/personal_access_tokens.html.erb     │ new
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │ app/views/my/_sidebar.html.erb                   │ link
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │ config/locales/en.yml                            │ new keys
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │ test/unit/personal_access_token_test.rb          │ new
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │ test/integration/api_test/authentication_test.rb │ PAT cases appended
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │ test/functional/my_controller_test.rb            │ management cases
+     │
+     │                                                  │ appended
+     │
+     ├──────────────────────────────────────────────────┼───────────────────────
+     ┤
+     │ test/fixtures/personal_access_tokens.yml         │ new
+     │
+     └──────────────────────────────────────────────────┴───────────────────────
+     ┘
+
+     Verification
+
+     Focused, during implementation:
+     - bin/rails test test/unit/personal_access_token_test.rb
+     - bin/rails test test/integration/api_test/authentication_test.rb (must
+     stay green — proves legacy untouched)
+     - bin/rails test test/unit/token_test.rb test/unit/user_test.rb
+     - bin/rails test test/functional/my_controller_test.rb
+     - bin/rails test test/integration/api_test/disabled_rest_api_test.rb
+
+     Required test cases:
+     1. Happy path — X-Redmine-API-Key header → 200; HTTP Basic username → 200
+     2. PAT via ?key= → 401 (query-parameter auth forbidden)
+     3. Unknown token → 401
+     4. Expiry boundary: expires_on = Date.today → valid; expires_on = 
+     Date.today - 1 → 401
+     5. Revoked (row deleted) → 401
+     6. Locked user (STATUS_LOCKED) → 401; registered user → 401
+     7. PAT rejected when Setting.rest_api_enabled = '0'
+     8. PAT rejected on an action without accept_api_auth
+     9. Legacy 40-hex key still works via ?key=, header and Basic (regression)
+     10. POST /my/personal_access_tokens.json with a PAT → 403 (no privilege
+     escalation)
+     11. User A cannot revoke User B's PAT → 404, and B's token still
+     authenticates
+     12. Plaintext appears in the create response exactly once; a follow-up GET
+     does not contain it
+     13. token_hash in DB ≠ plaintext; no column holds plaintext
+     14. Blank expiry → validation error "Expiration date is required"; past
+     date rejected
+     15. user.destroy destroys the user's PATs
+     16. A PAT value passed to User.find_by_api_key returns nil (namespace
+     disjointness)
+     17. A PAT without a valid user cannot be created — user nil → invalid, and
+     user_id pointing at a nonexistent row → invalid (proves :optional => false
+     validates association resolution, not just presence of the id)
+
+     Mandatory gates before completion:
+     1. bundle exec rubocop
+     2. bundle exec rake test
+     3. bundle exec rails db:migrate from the stock 6.1.2 schema, then
+     db:rollback
+     4. App boots after migration
+     5. Manual curl happy path via header and Basic; manual check that
+     ?key=<pat> is rejected
+
+     Deferred (explicit)
+
+     Rate limiting · scopes and granular endpoint control (seam noted:
+     role.rb:204-210
+     allowed_to?(action, scope), user.rb:770,789, user.rb:736-744) · audit
+     logging ·
+     CORS · last_used_on · maximum-lifetime cap · admin management of other
+     users' PATs ·
+     legacy→PAT migration · a Setting to disable legacy keys · adding 'api' to
+     user.rb:962
+     destroy_tokens · adding :key to config.filter_parameters (now purely legacy
+     hardening, since PATs never appear in a URL) · bulk cleanup of expired rows
+     (cf.
+     Token.destroy_expired, called only from lib/tasks/redmine.rake:39) · REST
+     endpoints
+     for PAT management · rake locales:update backfill · changes to
+     X-Redmine-Switch-User.
+
+⏺ Plan approved. Executing step 1 only — the plan artifact — then stopping.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Write(doc/issue-43881/plan.md)
+  ⎿  Wrote 540 lines to doc/issue-43881/plan.md
+       1 # Personal Access Tokens for the Redmine REST API
+       3 Issue: <https://www.redmine.org/issues/43881> — "Strengthen API 
+         authentication"
+         , TINY 2, BRANCH `stable`)
+       5 Branch: `feature/43881-strengthen-API-authentication`
+       7 
+       8 **Status: plan approved. Implementation not started and not yet 
+       9 Creating this document is the only action taken so far. Applicat
+         ion code changes require
+         ate)).
+     … +777 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Step 1 complete. Stopping here as instructed.
+
+  Created doc/issue-43881/plan.md (540 lines). git status confirms the only
+  addition is doc/issue-43881/ — no application code touched. (CLAUDE.md was
+  already modified before this session began; I have not touched it.)
+
+  The artifact covers every element CLAUDE.md workflow step 4 requires:
+
+  ┌───────────────────┬─────────────────────────────────────────────────────┐
+  │     Required      │                       Section                       │
+  ├───────────────────┼─────────────────────────────────────────────────────┤
+  │ Approved scope    │ §2                                                  │
+  ├───────────────────┼─────────────────────────────────────────────────────┤
+  │ Alternatives      │ §4 — all three options with the rejection rationale │
+  │ considered        │  for each                                           │
+  ├───────────────────┼─────────────────────────────────────────────────────┤
+  │ Decisions &       │ §5 — nine decisions, each traced to repository      │
+  │ rationale         │ evidence                                            │
+  ├───────────────────┼─────────────────────────────────────────────────────┤
+  │ Trade-offs        │ §10                                                 │
+  ├───────────────────┼─────────────────────────────────────────────────────┤
+  │ Deferred work     │ §8 — split into by instruction, optional pillars,   │
+  │                   │ scope decisions, and unrelated legacy hardening     │
+  ├───────────────────┼─────────────────────────────────────────────────────┤
+  │ Acceptance        │ §7 — the 17 required tests                          │
+  │ criteria          │                                                     │
+  ├───────────────────┼─────────────────────────────────────────────────────┤
+  │ Verification      │ §9 — focused tests plus the six mandatory gates     │
+  │ strategy          │                                                     │
+  └───────────────────┴─────────────────────────────────────────────────────┘
+
+  Two things I carried into the document deliberately, so a reviewer meets them
+  rather than discovers them:
+
+  - §3 records the one unverified assumption plainly — the mandatory-expiry
+  requirement rests on your statement of the ticket, since there's no copy of
+  #43881 in the repo. Everything else cites a file and line.
+  - §5.7 documents the must_change_password? asymmetry that results from not
+  adding a check: PATs via Basic inherit the existing 403 at
+  application_controller.rb:154-157, PATs via header don't. That's exactly how
+  legacy keys behave today, but it's the kind of thing a reviewer flags, so the
+  plan states it's inherited rather than introduced.
+
+  Implementation of §6 is blocked pending your explicit approval. Nothing under
+  app/, db/, config/ or test/ will change until you give it.
+
+✻ Cooked for 2m 58s

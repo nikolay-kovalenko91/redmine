@@ -138,6 +138,7 @@ en:
         must_contain_digits: "must contain digits (0-9)"
         must_contain_special_chars: "must contain special characters (!, $, %, ...)"
         domain_not_allowed: "contains a domain not allowed (%{domain})"
+        cannot_be_in_the_past: "cannot be in the past"
         too_simple: "is too simple"
     attributes:
       doorkeeper/application:
@@ -179,6 +180,7 @@ en:
   notice_email_error: "An error occurred while sending mail (%{value})"
   notice_feeds_access_key_reseted: Your Atom access key was reset.
   notice_api_access_key_reseted: Your API access key was reset.
+  notice_personal_access_token_revoked: The personal access token was revoked.
   notice_failed_to_save_issues: "Failed to save %{count} issue(s) on %{total} selected: %{ids}."
   notice_failed_to_save_time_entries: "Failed to save %{count} time entrie(s) on %{total} selected: %{ids}."
   notice_failed_to_save_members: "Failed to save member(s): %{errors}."
@@ -316,6 +318,7 @@ en:
   field_tracker: Tracker
   field_subject: Subject
   field_due_date: Due date
+  field_expires_on: Expires on
   field_assigned_to: Assignee
   field_priority: Priority
   field_fixed_version: Target version
@@ -1030,6 +1033,8 @@ en:
   label_api_access_key: API access key
   label_missing_api_access_key: Missing an API access key
   label_api_access_key_created_on: "API access key created %{value} ago"
+  label_personal_access_tokens: Personal access tokens
+  label_personal_access_token_new: New personal access token
   label_profile: Profile
   label_subtask: Subtask
   label_subtask_plural: Subtasks
@@ -1277,6 +1282,7 @@ en:
   text_users_bulk_destroy_confirm: 'To confirm, please enter "%{yes}" below.'
   text_workflow_edit: Select a role and a tracker to edit the workflow
   text_are_you_sure: Are you sure?
+  text_personal_access_token_created: "Make sure to copy your new personal access token now. You won't be able to see it again."
   text_journal_changed: "%{label} changed from %{old} to %{new}"
   text_journal_changed_no_detail: "%{label} updated"
   text_journal_set_to: "%{label} set to %{value}"

@@ -832,4 +832,65 @@ class MyControllerTest < Redmine::ControllerTest
     assert_match /reset/, flash[:notice]
     assert_redirected_to '/my/account'
   end
+
+  def test_personal_access_tokens_should_list_current_users_tokens
+    get :personal_access_tokens
+    assert_response :success
+    assert_select 'td.name', :text => 'Jsmith token'
+    assert_select 'td.name', {:count => 0, :text => 'Valid token'}
+  end
+
+  def test_create_personal_access_token_should_create_token_and_render_plaintext_once
+    assert_difference 'PersonalAccessToken.count' do
+      post :create_personal_access_token, :params => {
+        :personal_access_token => {:name => 'New CI token', :expires_on => (Date.today + 30).to_s}
+      }
+    end
+    assert_response :success
+
+    token = PersonalAccessToken.order(:id => :desc).first
+    assert_equal 'New CI token', token.name
+    assert_equal User.find(2), token.user
+    assert_select 'pre[data-api-key-copy-target="apiKey"]', :text => token.plain_token
+  end
+
+  def test_create_personal_access_token_with_blank_expiry_should_show_errors
+    assert_no_difference 'PersonalAccessToken.count' do
+      post :create_personal_access_token, :params => {
+        :personal_access_token => {:name => 'New CI token', :expires_on => ''}
+      }
+    end
+    assert_response :success
+    assert_select '#errorExplanation'
+  end
+
+  def test_create_personal_access_token_with_past_expiry_should_show_errors
+    assert_no_difference 'PersonalAccessToken.count' do
+      post :create_personal_access_token, :params => {
+        :personal_access_token => {:name => 'New CI token', :expires_on => (Date.today - 1).to_s}
+      }
+    end
+    assert_response :success
+    assert_select '#errorExplanation'
+  end
+
+  def test_revoke_personal_access_token_should_destroy_own_token
+    token = personal_access_tokens(:personal_access_tokens_003)
+    assert_equal User.find(2), token.user
+
+    delete :revoke_personal_access_token, :params => {:id => token.id}
+
+    assert_redirected_to '/my/personal_access_tokens'
+    assert_nil PersonalAccessToken.find_by_id(token.id)
+  end
+
+  def test_revoke_personal_access_token_should_not_destroy_another_users_token
+    token = personal_access_tokens(:personal_access_tokens_001)
+    assert_not_equal User.find(2), token.user
+
+    delete :revoke_personal_access_token, :params => {:id => token.id}
+
+    assert_response :not_found
+    assert PersonalAccessToken.exists?(token.id)
+  end
 end

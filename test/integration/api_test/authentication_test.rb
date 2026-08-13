@@ -161,4 +161,117 @@ class Redmine::ApiTest::AuthenticationTest < Redmine::ApiTest::Base
     assert_response :success
     assert_select 'h2', :text => "#{user.initials} #{user.name}"
   end
+
+  def test_api_should_accept_auth_using_personal_access_token_as_request_header
+    user = User.generate!
+    pat = PersonalAccessToken.create!(:user => user, :name => 'CI', :expires_on => Date.today + 1)
+
+    get '/users/current.xml', :headers => {'X-Redmine-API-Key' => pat.plain_token}
+    assert_response :ok
+  end
+
+  def test_api_should_accept_http_basic_auth_using_personal_access_token
+    user = User.generate!
+    pat = PersonalAccessToken.create!(:user => user, :name => 'CI', :expires_on => Date.today + 1)
+
+    get '/users/current.xml', :headers => credentials(pat.plain_token, 'X')
+    assert_response :ok
+  end
+
+  def test_api_should_deny_auth_using_personal_access_token_as_parameter
+    user = User.generate!
+    pat = PersonalAccessToken.create!(:user => user, :name => 'CI', :expires_on => Date.today + 1)
+
+    get "/users/current.xml?key=#{pat.plain_token}"
+    assert_response :unauthorized
+  end
+
+  def test_api_should_deny_auth_using_unknown_personal_access_token
+    get '/users/current.xml', :headers => {'X-Redmine-API-Key' => "pat_#{'0' * 40}"}
+    assert_response :unauthorized
+  end
+
+  def test_api_should_deny_auth_using_expired_personal_access_token
+    user = User.generate!
+    pat = PersonalAccessToken.create!(:user => user, :name => 'CI', :expires_on => Date.today + 1)
+    PersonalAccessToken.where(:id => pat.id).update_all(:expires_on => Date.today - 1)
+
+    get '/users/current.xml', :headers => {'X-Redmine-API-Key' => pat.plain_token}
+    assert_response :unauthorized
+  end
+
+  def test_api_should_accept_auth_using_personal_access_token_on_its_expiry_date
+    user = User.generate!
+    pat = PersonalAccessToken.create!(:user => user, :name => 'CI', :expires_on => Date.today + 1)
+    PersonalAccessToken.where(:id => pat.id).update_all(:expires_on => Date.today)
+
+    get '/users/current.xml', :headers => {'X-Redmine-API-Key' => pat.plain_token}
+    assert_response :ok
+  end
+
+  def test_api_should_deny_auth_using_revoked_personal_access_token
+    user = User.generate!
+    pat = PersonalAccessToken.create!(:user => user, :name => 'CI', :expires_on => Date.today + 1)
+    plain = pat.plain_token
+    pat.destroy
+
+    get '/users/current.xml', :headers => {'X-Redmine-API-Key' => plain}
+    assert_response :unauthorized
+  end
+
+  def test_api_should_deny_auth_using_personal_access_token_of_locked_user
+    user = User.generate!
+    pat = PersonalAccessToken.create!(:user => user, :name => 'CI', :expires_on => Date.today + 1)
+    user.update_column(:status, User::STATUS_LOCKED)
+
+    get '/users/current.xml', :headers => {'X-Redmine-API-Key' => pat.plain_token}
+    assert_response :unauthorized
+  end
+
+  def test_api_should_deny_auth_using_personal_access_token_of_registered_user
+    user = User.generate!
+    pat = PersonalAccessToken.create!(:user => user, :name => 'CI', :expires_on => Date.today + 1)
+    user.update_column(:status, User::STATUS_REGISTERED)
+
+    get '/users/current.xml', :headers => {'X-Redmine-API-Key' => pat.plain_token}
+    assert_response :unauthorized
+  end
+
+  def test_personal_access_token_should_be_rejected_when_rest_api_disabled
+    Setting.rest_api_enabled = '0'
+    user = User.generate!
+    pat = PersonalAccessToken.create!(:user => user, :name => 'CI', :expires_on => Date.today + 1)
+
+    get '/users/current.xml', :headers => {'X-Redmine-API-Key' => pat.plain_token}
+    assert_response :forbidden
+  ensure
+    Setting.rest_api_enabled = '1'
+  end
+
+  def test_personal_access_token_should_be_rejected_on_action_without_accept_api_auth
+    user = User.generate!
+    pat = PersonalAccessToken.create!(:user => user, :name => 'CI', :expires_on => Date.today + 1)
+
+    get '/my/page.json', :headers => {'X-Redmine-API-Key' => pat.plain_token}
+    assert_response :forbidden
+  end
+
+  def test_personal_access_token_should_not_be_able_to_create_another_personal_access_token
+    user = User.generate!
+    pat = PersonalAccessToken.create!(:user => user, :name => 'CI', :expires_on => Date.today + 1)
+
+    assert_no_difference 'PersonalAccessToken.count' do
+      post '/my/personal_access_tokens.json',
+           :params => {:personal_access_token => {:name => 'Escalated', :expires_on => (Date.today + 1).to_s}},
+           :headers => {'X-Redmine-API-Key' => pat.plain_token}
+    end
+    assert_response :forbidden
+  end
+
+  def test_personal_access_token_value_should_not_authenticate_via_legacy_api_key_lookup
+    user = User.generate!
+    pat = PersonalAccessToken.create!(:user => user, :name => 'CI', :expires_on => Date.today + 1)
+
+    assert_nil User.find_by_api_key(pat.plain_token)
+  end
 end

@@ -1,0 +1,24 @@
+---
+personal_access_tokens_001:
+  id: 1
+  user_id: 1
+  name: Valid token
+  token_hash: 0b00d696dd14bfd076316b05a317b0cc6fac2d5567f6c92224dd769eaab29de6
+  expires_on: 2030-12-31
+  created_on: 2026-01-01 12:00:00
+
+personal_access_tokens_002:
+  id: 2
+  user_id: 1
+  name: Expired token
+  token_hash: e334958ce59d10e0741f4b2f321d329f677c04d76a9024419e40254dda18c2cd
+  expires_on: 2020-01-01
+  created_on: 2019-12-01 12:00:00
+
+personal_access_tokens_003:
+  id: 3
+  user_id: 2
+  name: Jsmith token
+  token_hash: 3819a8357c69a75cc49a8f466c6902a63943bdca8e2f790fc3cf9610e427a58c
+  expires_on: 2030-12-31
+  created_on: 2026-01-01 12:00:00
