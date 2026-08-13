@@ -129,8 +129,13 @@ class ApplicationController < ActionController::Base
     end
     if user.nil? && Setting.rest_api_enabled? && accept_api_auth?
       if (key = api_key_from_request)
-        # Use API key
-        user = User.find_by_api_key(key)
+        if PersonalAccessToken.pat_format?(key)
+          # Personal access tokens are never accepted as a query parameter
+          user = PersonalAccessToken.find_active_user(key) if params[:key].blank?
+        else
+          # Use API key
+          user = User.find_by_api_key(key)
+        end
       elsif access_token = Doorkeeper.authenticate(request)
         # Oauth
         if access_token.accessible?
@@ -149,7 +154,11 @@ class ApplicationController < ActionController::Base
             return
           end
 
-          user ||= User.find_by_api_key(username)
+          user ||= if PersonalAccessToken.pat_format?(username)
+                     PersonalAccessToken.find_active_user(username)
+                   else
+                     User.find_by_api_key(username)
+                   end
         end
         if user && user.must_change_password?
           render_error :message => 'You must change your password', :status => 403

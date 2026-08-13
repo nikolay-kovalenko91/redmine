@@ -27,6 +27,7 @@ class MyController < ApplicationController
 
   require_sudo_mode :account, only: :put
   require_sudo_mode :reset_atom_key, :reset_api_key, :show_api_key, :destroy
+  require_sudo_mode :personal_access_tokens, :create_personal_access_token, :revoke_personal_access_token
 
   helper :issues
   helper :users
@@ -148,6 +149,36 @@ class MyController < ApplicationController
     redirect_to my_account_path
   end
 
+  # List and create personal access tokens
+  def personal_access_tokens
+    @user = User.current
+    @tokens = @user.personal_access_tokens.order(:id => :desc)
+    @token = @user.personal_access_tokens.build
+  end
+
+  # Create a personal access token
+  #
+  # Renders in place rather than redirecting: the plaintext value is
+  # returned exactly once and must never pass through flash, session or a
+  # URL, none of which a redirect could avoid.
+  def create_personal_access_token
+    @user = User.current
+    @token = @user.personal_access_tokens.build(personal_access_token_params)
+    @token.save
+    @tokens = @user.personal_access_tokens.order(:id => :desc)
+    render :action => 'personal_access_tokens'
+  end
+
+  # Revoke (permanently delete) one of the current user's personal access tokens
+  def revoke_personal_access_token
+    token = User.current.personal_access_tokens.find(params[:id])
+    token.destroy
+    flash[:notice] = l(:notice_personal_access_token_revoked)
+    redirect_to my_personal_access_tokens_path
+  rescue ActiveRecord::RecordNotFound
+    render_404
+  end
+
   def update_page
     @user = User.current
     block_settings = params[:settings] || {}
@@ -197,5 +228,11 @@ class MyController < ApplicationController
     @user.pref.order_blocks params[:group], params[:blocks]
     @user.pref.save
     head :ok
+  end
+
+  private
+
+  def personal_access_token_params
+    params.require(:personal_access_token).permit(:name, :expires_on)
   end
 end

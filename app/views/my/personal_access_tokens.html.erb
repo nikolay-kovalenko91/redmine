@@ -1,0 +1,62 @@
+<h2><%= l(:label_personal_access_tokens) %></h2>
+
+<% if @token.persisted? && @token.plain_token %>
+<div class="box" id="new-personal-access-token">
+  <p class="warning"><%= l(:text_personal_access_token_created) %></p>
+  <div data-controller="api-key-copy">
+    <div class="api-key-actions">
+      <a class="copy-api-key-link icon icon-only"
+         title="<%= l(:button_copy) %>"
+         aria-label="<%= l(:button_copy) %>"
+         href="#"
+         role="button"
+         tabindex="0"
+         data-action="click->api-key-copy#copy">
+        <%= sprite_icon('copy') %>
+      </a>
+    </div>
+    <pre class="autoscroll" data-api-key-copy-target="apiKey"><%= @token.plain_token %></pre>
+  </div>
+</div>
+<% end %>
+
+<% if @tokens.any? %>
+<table class="list personal_access_tokens">
+  <thead><tr>
+    <th><%= l(:field_name) %></th>
+    <th><%= l(:field_expires_on) %></th>
+    <th><%= l(:field_created_on) %></th>
+    <th></th>
+  </tr></thead>
+  <tbody>
+  <% @tokens.each do |token| %>
+    <tr class="<%= cycle('odd', 'even') %>">
+      <td class="name"><%= token.name %></td>
+      <td><%= format_date(token.expires_on) %></td>
+      <td><%= format_time(token.created_on) %></td>
+      <td class="buttons"><%= delete_link my_personal_access_token_path(token) %></td>
+    </tr>
+  <% end %>
+  </tbody>
+</table>
+<% else %>
+<p class="nodata"><%= l(:label_no_data) %></p>
+<% end %>
+
+<h3><%= l(:label_personal_access_token_new) %></h3>
+
+<%= error_messages_for 'token' %>
+
+<%= labelled_form_for @token, :as => :personal_access_token, :url => my_personal_access_tokens_path do |f| %>
+<div class="box tabular">
+  <p><%= f.text_field :name, :maxlength => 60, :size => 30, :required => true %></p>
+  <p><%= f.date_field :expires_on, :size => 10, :required => true %><%= calendar_for('personal_access_token_expires_on') %></p>
+</div>
+<p><%= submit_tag l(:button_create) %></p>
+<% end %>
+
+<% content_for :sidebar do %>
+<%= render :partial => 'sidebar' %>
+<% end %>
+
+<% html_title(l(:label_personal_access_tokens)) -%>
